@@ -1,0 +1,14 @@
+{
+  "appId": "br.com.kairostelecom.frota",
+  "appName": "Kairos Frota",
+  "webDir": "dist",
+  "backgroundColor": "#16266B",
+  "server": { "androidScheme": "https" },
+  "plugins": {
+    "SplashScreen": {
+      "launchShowDuration": 1200,
+      "backgroundColor": "#16266B",
+      "showSpinner": false
+    }
+  }
+}
