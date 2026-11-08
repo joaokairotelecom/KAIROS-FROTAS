@@ -1,7 +1,7 @@
 {
   "name": "kairos-frota-erp",
   "private": true,
-  "version": "1.0.0",
+  "version": "2.1.0",
   "type": "module",
   "description": "ERP de Gestão de Frotas — Kairos Telecom / Kaironanet Ltda",
   "author": "João Paulo (Kairos Telecom)",
