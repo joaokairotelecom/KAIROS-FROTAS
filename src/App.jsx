@@ -9,7 +9,7 @@ import {
   ResponsiveContainer, LineChart, Line, XAxis, YAxis, Tooltip, CartesianGrid,
   BarChart, Bar, PieChart, Pie, Cell, Legend
 } from "recharts";
-import { store, uploadImage } from "./lib/data.js";
+import { store, uploadImage, loadAll } from "./lib/data.js";
 import { askAI } from "./lib/ai.js";
 import { LOGO } from "./lib/logo.js";
 import { supabase, hasSupabase } from "./lib/supabase.js";
@@ -41,9 +41,11 @@ const enc = (s) => { try { return btoa(unescape(encodeURIComponent(s))); } catch
 const dec = (s) => { try { return String(s).startsWith("p:") ? String(s).slice(2) : decodeURIComponent(escape(atob(s))); } catch (e) { return ""; } };
 
 /* ================= PERSISTÊNCIA (Supabase + fallback local via ./lib/data) ================= */
-const DOMAINS = ["users", "vehicles", "fuel", "costs", "plans", "mrecords", "os", "tires", "wear", "checklists", "damages", "fuels", "equipTypes", "diagrams", "calibrations", "inspections", "audit", "settings"];
+const DOMAINS = ["users", "vehicles", "fuel", "costs", "plans", "mrecords", "os", "tires", "wear", "tiremoves", "tireBrands", "tireModels", "tireSizes", "checklists", "damages", "fuels", "equipTypes", "diagrams", "calibrations", "inspections", "audit", "settings"];
 const DEF_ALERTCFG = { calibIntervalDias: 15, inspIntervalDias: 30, consumoQuedaPct: 20, custoLimiteMes: 0, diasParado: 15, sulcoMinimo: 1.6, numSulcos: 4, prevKm: 10000, prevHoras: 250, prevDias: 180 };
-const EMPTY = { users: [], vehicles: [], fuel: [], costs: [], plans: [], mrecords: [], os: [], tires: [], wear: [], checklists: [], damages: [], fuels: [], equipTypes: [], diagrams: [], calibrations: [], inspections: [], audit: [], settings: { proxOS: 1, autoOS: true, firstRun: true, permOverrides: {}, alertCfg: DEF_ALERTCFG } };
+const EMPTY = { users: [], vehicles: [], fuel: [], costs: [], plans: [], mrecords: [], os: [], tires: [], wear: [], tiremoves: [], tireBrands: [], tireModels: [], tireSizes: [], checklists: [], damages: [], fuels: [], equipTypes: [], diagrams: [], calibrations: [], inspections: [], audit: [], settings: { proxOS: 1, autoOS: true, firstRun: true, permOverrides: {}, alertCfg: DEF_ALERTCFG } };
+// Desenhos de banda/piso (lista pré-definida + livre)
+const DESENHOS_PNEU = ["Liso", "Misto", "Tração (borrachudo)", "Direcional", "Rib (rodoviário)", "Lug", "All position", "Off-road"];
 
 /* ================= IA (API Anthropic) ================= */
 const fileToDataURL = (f) => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(f); });
@@ -82,7 +84,58 @@ const CAUSAS_DESGASTE = {
 };
 const PRIORIDADES = { baixa: ["Baixa", "slate"], media: ["Média", "blue"], alta: ["Alta", "amber"], urgente: ["Urgente", "red"] };
 const OS_STATUS = { aberta: ["Aberta", "blue"], em_execucao: ["Em execução", "amber"], concluida: ["Concluída", "green"], cancelada: ["Cancelada", "slate"] };
-const TIRE_STATUS = { estoque: ["Em estoque", "blue"], em_uso: ["Em uso", "green"], recapagem: ["Em recapagem", "amber"], conserto: ["Em conserto", "amber"], sucateado: ["Sucateado", "red"] };
+const TIRE_STATUS = { estoque: ["Em estoque", "blue"], em_uso: ["Aplicado", "green"], recapagem: ["Em recapagem", "amber"], analise: ["Em análise", "yellow"], conserto: ["Em conserto", "amber"], sucateado: ["Descartado", "red"] };
+// Padrão Prolog: ciclo de vidas do pneu (1ª vida = novo, 2ª+ = recapado)
+const VIDAS = { 1: "1ª vida (novo)", 2: "2ª vida", 3: "3ª vida", 4: "4ª vida", 5: "5ª vida" };
+const vidaLabel = (n) => VIDAS[n] || (n ? n + "ª vida" : "1ª vida (novo)");
+// Sulcos medidos por posição (padrão Prolog)
+const SULCOS_POS = [["interno", "Interno"], ["centroInt", "Centro int."], ["centroExt", "Centro ext."], ["externo", "Externo"]];
+// Motivos de movimentação
+const MOV_MOTIVOS = ["Aplicação (novo)", "Rodízio", "Desgaste", "Recapagem", "Conserto", "Avaria", "Preventiva", "Fim de vida", "Transferência de veículo", "Outro"];
+// Estado de aparência do pneu (para desgaste/descarte)
+const APARENCIA = ["Bom", "Regular", "Atenção", "Crítico"];
+// Motivos de descarte
+const DESCARTE_MOTIVOS = ["Fim de vida útil", "Desgaste total", "Avaria irreparável", "Bolha/separação", "Corte/perfuração", "Desgaste irregular severo", "Idade (DOT)", "Outro"];
+
+/* ================= CÁLCULOS DE PNEUS (padrão Prolog) ================= */
+// Menor sulco atual a partir dos 4 pontos medidos
+function menorSulco(t) {
+  const vals = SULCOS_POS.map(([k]) => num(t["sulco_" + k])).filter((x) => x > 0);
+  return vals.length ? Math.min(...vals) : null;
+}
+function sulcoMedio(t) {
+  const vals = SULCOS_POS.map(([k]) => num(t["sulco_" + k])).filter((x) => x > 0);
+  return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
+}
+// KM rodado na vida atual (desde a montagem, somado ao acumulado da vida)
+function kmVidaAtual(t, vmap) {
+  let km = num(t.kmVida);
+  if (t.status === "em_uso" && t.veiculoId) { const v = vmap[t.veiculoId]; if (v) km += Math.max(0, num(v.kmAtual) - num(t.kmMontagem)); }
+  return km;
+}
+// KM acumulado em todas as vidas
+function kmAcumuladoTotal(t, vmap) {
+  const vidasAnt = (t.historicoVidas || []).reduce((a, h) => a + num(h.km), 0);
+  return vidasAnt + kmVidaAtual(t, vmap);
+}
+// Valor total investido (aquisição + todas as bandas/recapagens)
+function valorAcumulado(t) {
+  const bandas = (t.historicoVidas || []).reduce((a, h) => a + num(h.valorBanda), 0) + num(t.valorBanda);
+  return num(t.valor) + bandas;
+}
+// CPK (custo por km) da vida atual e acumulado
+function cpkVidaAtual(t, vmap) { const km = kmVidaAtual(t, vmap); const custo = num(t.vida) > 1 ? num(t.valorBanda) : num(t.valor); return km > 0 && custo > 0 ? custo / km : 0; }
+function cpkAcumulado(t, vmap) { const km = kmAcumuladoTotal(t, vmap); const v = valorAcumulado(t); return km > 0 && v > 0 ? v / km : 0; }
+// Desgaste em mm e km/mm (quanto o pneu roda por mm de sulco gasto)
+function mmGasto(t) { const ini = num(t.mmInicial) || num(t.mmNovo); const atual = menorSulco(t); return ini > 0 && atual != null ? Math.max(0, ini - atual) : null; }
+function kmPorMm(t, vmap) { const mm = mmGasto(t); const km = kmVidaAtual(t, vmap); return mm > 0 && km > 0 ? km / mm : null; }
+// Previsão de troca: com base no desgaste até o sulco mínimo
+function previsaoTroca(t, vmap, sulcoMin = 1.6) {
+  const atual = menorSulco(t); const kmmm = kmPorMm(t, vmap);
+  if (atual == null || !kmmm || atual <= sulcoMin) return { kmRestante: 0, mmRestante: 0, prazo: atual != null && atual <= sulcoMin ? "Trocar agora" : null };
+  const mmRest = atual - sulcoMin; const kmRest = mmRest * kmmm;
+  return { kmRestante: Math.round(kmRest), mmRestante: +mmRest.toFixed(1), prazo: null };
+}
 
 /* ================= SEEDS PARAMETRIZÁVEIS (ERP) ================= */
 const SEED_FUELS = ["Gasolina Comum", "Gasolina Aditivada", "Etanol", "Diesel S10", "Diesel S500", "Biodiesel", "Arla 32", "GLP", "GNV", "Elétrico", "Híbrido"].map((n, i) => ({ id: "fuel-" + i, nome: n, ativo: true }));
@@ -222,6 +275,8 @@ const allCostRows = (data) => [
   ...data.fuel.map((f) => ({ data: f.data, veiculoId: f.veiculoId, categoria: "Combustível", valor: num(f.valorTotal), motorista: f.motorista || "", desc: "Abastecimento " + fmtN(f.litros, 1) + " L" })),
 ];
 const tireKm = (t, vmap) => {
+  // Compatível com dados antigos (kmAcumulado) e novos (kmVida + historicoVidas)
+  if (t.historicoVidas !== undefined || t.kmVida !== undefined) return kmAcumuladoTotal(t, vmap);
   let km = num(t.kmAcumulado);
   if (t.status === "em_uso" && t.veiculoId) { const v = vmap[t.veiculoId]; if (v) km += Math.max(0, num(v.kmAtual) - num(t.kmMontagem)); }
   return km;
@@ -617,7 +672,7 @@ const CAR_SVG = {
 };
 
 /* ================= LOGIN ================= */
-function Login({ users, onLogin, onSeed }) {
+function Login({ users, onLogin, onSeed, bootErr }) {
   const [u, setU] = useState(""); const [p, setP] = useState(""); const [err, setErr] = useState("");
   const submit = () => {
     const found = users.find((x) => x.login.toLowerCase() === u.trim().toLowerCase() && x.ativo !== false);
@@ -632,6 +687,7 @@ function Login({ users, onLogin, onSeed }) {
             <img src={LOGO} alt="Kairos Telecom" className="h-16 w-auto mx-auto mb-3 object-contain" />
             <h1 className="text-lg font-extrabold text-slate-900" style={{ fontFamily: "Archivo, sans-serif" }}>Kairos Frota</h1>
             <p className="text-xs text-slate-500 mt-0.5">Gestão Inteligente de Frotas</p>
+            {bootErr && <p className="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-2 py-1.5 mt-2">{bootErr}</p>}
           </div>
           <div className="px-8 py-6 space-y-3">
             {users.length === 0 ? (
@@ -787,6 +843,8 @@ function Veiculos({ data, save, user, focus, clearFocus }) {
   const lists = useMemo(() => ({
     marca: [...new Set(data.vehicles.map((v) => v.marca).filter(Boolean))],
     centroCusto: [...new Set(data.vehicles.map((v) => v.centroCusto).filter(Boolean))],
+    contrato: [...new Set(data.vehicles.map((v) => v.contrato).filter(Boolean))],
+    regional: [...new Set(data.vehicles.map((v) => v.regional).filter(Boolean))],
   }), [data.vehicles]);
   const fuels = (data.fuels || []).filter((f) => f.ativo !== false);
   useEffect(() => { if (focus) { const v = data.vehicles.find((x) => x.id === focus); if (v) setView(v); clearFocus(); } }, [focus]);
@@ -916,6 +974,8 @@ function VeicForm({ edit, setEdit, submit, data, lists, fuels, etOf }) {
           <Field label={usaHor ? "Horímetro atual (h) *" : "KM atual *"}>{usaHor ? <Inp type="number" step="0.1" value={edit.horimetro || ""} onChange={(e) => setEdit({ ...edit, horimetro: e.target.value, kmAtual: edit.kmAtual || "0" })} /> : <Inp type="number" value={edit.kmAtual || ""} onChange={(e) => set("kmAtual", e.target.value)} />}</Field>
           <Field label="Status" req><Sel value={edit.status} onChange={(e) => set("status", e.target.value)}>{Object.entries(STATUS_VEIC).map(([k, v]) => <option key={k} value={k}>{v[0]}</option>)}</Sel></Field>
           <Field label="Centro de custo"><Inp list="dl-cc" value={edit.centroCusto || ""} onChange={(e) => set("centroCusto", e.target.value)} /><datalist id="dl-cc">{lists.centroCusto.map((m) => <option key={m} value={m} />)}</datalist></Field>
+          <Field label="Unidade / Contrato" hint="Ex.: AMP, Parauapebas"><Inp list="dl-ct" value={edit.contrato || ""} onChange={(e) => set("contrato", e.target.value)} /><datalist id="dl-ct">{(lists.contrato || []).map((m) => <option key={m} value={m} />)}</datalist></Field>
+          <Field label="Regional"><Inp list="dl-rg" value={edit.regional || ""} onChange={(e) => set("regional", e.target.value)} /><datalist id="dl-rg">{(lists.regional || []).map((m) => <option key={m} value={m} />)}</datalist></Field>
         </div>
       )}
 
@@ -1414,71 +1474,133 @@ function OrdensServico({ data, save, user, seedOS, clearSeed }) {
   );
 }
 
-/* ================= PNEUS ================= */
+/* ================= PNEUS (reconstruído — padrão Prolog) ================= */
 function Pneus({ data, save, user }) {
-  const [tab, setTab] = useState("frota"); const [edit, setEdit] = useState(null); const [mount, setMount] = useState(null); const [wear, setWear] = useState(null);
+  const [tab, setTab] = useState("frota");
   const editable = can(user, "pneus", "edit");
   const vmap = Object.fromEntries(data.vehicles.map((v) => [v.id, v]));
-  const km = (t) => tireKm(t, vmap);
+  const cfg = { ...DEF_ALERTCFG, ...(data.settings.alertCfg || {}) };
+  const sulcoMin = num(cfg.sulcoMinimo) || 1.6;
 
-  const startNew = () => setEdit({ status: "estoque", numeroFogo: "", dataCompra: todayISO(), kmAcumulado: 0 });
+  const [edit, setEdit] = useState(null);   // cadastro/edição do pneu
+  const [mov, setMov] = useState(null);     // movimentação (montar/rodízio/recapar/descartar)
+  const [wear, setWear] = useState(null);   // análise de desgaste
+  const [view, setView] = useState(null);   // ficha completa do pneu
+
+  const tires = data.tires;
+  const emUso = tires.filter((t) => t.status === "em_uso");
+  const estoque = tires.filter((t) => t.status === "estoque");
+  const descartados = tires.filter((t) => t.status === "sucateado");
+
+  /* ---- cadastro ---- */
+  const startNew = () => setEdit({ status: "estoque", numeroFogo: "", dataCompra: todayISO(), vida: 1, historicoVidas: [], kmVida: 0, mmNovo: "", mmInicial: "" });
   const submit = () => {
     if (!edit.numeroFogo) return;
-    const list = edit.id ? data.tires.map((t) => t.id === edit.id ? edit : t) : [...data.tires, { ...edit, id: uid(), criadoEm: nowISO() }];
+    if (tires.some((t) => t.id !== edit.id && String(t.numeroFogo).trim().toLowerCase() === String(edit.numeroFogo).trim().toLowerCase())) { alert("Já existe um pneu com este número de fogo."); return; }
+    const rec = { ...edit, vida: num(edit.vida) || 1, mmInicial: edit.mmInicial || edit.mmNovo };
+    const list = edit.id ? tires.map((t) => t.id === edit.id ? rec : t) : [...tires, { ...rec, id: uid(), criadoEm: nowISO() }];
     save({ tires: list }, (edit.id ? "Editou" : "Cadastrou") + " pneu fogo " + edit.numeroFogo);
     setEdit(null);
   };
-  const del = (t) => { if (!confirm("Remover pneu fogo " + t.numeroFogo + "?")) return; save({ tires: data.tires.filter((x) => x.id !== t.id) }, "Removeu pneu " + t.numeroFogo); setEdit(null); };
+  const del = (t) => { if (!confirm("Remover pneu fogo " + t.numeroFogo + "? O histórico de movimentações permanece registrado.")) return; save({ tires: tires.filter((x) => x.id !== t.id) }, "Removeu pneu " + t.numeroFogo); setEdit(null); setView(null); };
 
-  const doMount = () => {
-    const t = mount.tire;
-    const rec = { ...t, status: "em_uso", veiculoId: mount.veiculoId, posicao: mount.posicao, kmMontagem: num(mount.km), dataMontagem: mount.data };
-    save({ tires: data.tires.map((x) => x.id === t.id ? rec : x) }, "Montou pneu " + t.numeroFogo + " · " + (vmap[mount.veiculoId]?.prefixo || "") + " pos. " + mount.posicao);
-    setMount(null);
+  /* ---- movimentação (registra histórico em tiremoves) ---- */
+  const startMov = (tire, tipo) => {
+    const base = { tireId: tire.id, data: todayISO(), responsavel: user.nome, tipo, kmMov: tire.status === "em_uso" && tire.veiculoId ? num(vmap[tire.veiculoId]?.kmAtual) : "", sulcos: {}, fotos: [] };
+    if (tipo === "montar") base.veiculoId = emUso[0]?.veiculoId || "";
+    setMov({ ...base, tire });
   };
-  const dismount = (t, dest) => {
-    const rodado = Math.max(0, num(vmap[t.veiculoId]?.kmAtual) - num(t.kmMontagem));
-    const rec = { ...t, status: dest, veiculoId: "", posicao: "", kmAcumulado: num(t.kmAcumulado) + rodado, kmMontagem: 0 };
-    save({ tires: data.tires.map((x) => x.id === t.id ? rec : x) }, "Desmontou pneu " + t.numeroFogo + " → " + TIRE_STATUS[dest][0]);
+  const doMov = () => {
+    const t = mov.tire; if (!t) return;
+    const moves = [...(data.tiremoves || [])];
+    let rec = { ...t };
+    const vmov = vmap[mov.veiculoId];
+    const kmRodadoVida = kmVidaAtual(t, vmap);
+
+    if (mov.tipo === "montar") {
+      if (!mov.veiculoId || !mov.posicao) return;
+      rec = { ...t, status: "em_uso", veiculoId: mov.veiculoId, posicao: mov.posicao, kmMontagem: num(mov.kmMov), dataMontagem: mov.data };
+      moves.push(mvRec(mov, "Aplicação / montagem", "estoque", "", t.posicao, "aplicado", vmov?.prefixo, mov.posicao, kmRodadoVida));
+    } else if (mov.tipo === "desmontar") {
+      rec = { ...t, status: mov.destino || "estoque", kmVida: num(t.kmVida) + kmRodadoVida, veiculoId: "", posicao: "", kmMontagem: 0 };
+      moves.push(mvRec(mov, mov.motivo || "Desmontagem", "aplicado", vmap[t.veiculoId]?.prefixo, t.posicao, mov.destino || "estoque", "", "", kmRodadoVida));
+    } else if (mov.tipo === "rodizio") {
+      if (!mov.posicao) return;
+      moves.push(mvRec(mov, "Rodízio", "aplicado", vmap[t.veiculoId]?.prefixo, t.posicao, "aplicado", vmap[t.veiculoId]?.prefixo, mov.posicao, kmRodadoVida));
+      rec = { ...t, posicao: mov.posicao };
+    } else if (mov.tipo === "recapar") {
+      // encerra a vida atual, inicia nova vida
+      const hv = [...(t.historicoVidas || []), { vida: num(t.vida) || 1, km: kmRodadoVida, valorBanda: num(t.valorBanda), encerradaEm: mov.data, sulcoFinal: menorSulco(t) }];
+      rec = { ...t, status: "estoque", vida: (num(t.vida) || 1) + 1, kmVida: 0, veiculoId: "", posicao: "", kmMontagem: 0, historicoVidas: hv, valorBanda: num(mov.valorBanda) || 0, recapadora: mov.recapadora || "", mmInicial: mov.mmNova || t.mmNovo, sulco_interno: "", sulco_centroInt: "", sulco_centroExt: "", sulco_externo: "" };
+      moves.push(mvRec(mov, "Recapagem (nova vida)", "aplicado", vmap[t.veiculoId]?.prefixo, t.posicao, "recapagem", "", "", kmRodadoVida));
+    } else if (mov.tipo === "descartar") {
+      const hv = [...(t.historicoVidas || []), { vida: num(t.vida) || 1, km: kmRodadoVida, valorBanda: num(t.valorBanda), encerradaEm: mov.data, sulcoFinal: menorSulco(t) }];
+      rec = { ...t, status: "sucateado", kmVida: num(t.kmVida) + kmRodadoVida, historicoVidas: hv, veiculoId: "", posicao: "", kmMontagem: 0, descarte: { data: mov.data, responsavel: mov.responsavel, motivo: mov.motivoDescarte, aparencia: mov.aparencia, obs: mov.obs, fotos: mov.fotos || [] } };
+      moves.push(mvRec(mov, "Descarte: " + (mov.motivoDescarte || ""), "aplicado", vmap[t.veiculoId]?.prefixo, t.posicao, "descarte", "", "", kmRodadoVida));
+    }
+    save({ tires: tires.map((x) => x.id === t.id ? rec : x), tiremoves: moves }, mvLog(mov.tipo, t, vmov));
+    setMov(null);
   };
+  const mvRec = (mov, motivo, orig, placaO, posO, dest, placaD, posD, km) => ({
+    id: uid(), tireId: mov.tire.id, numeroFogo: mov.tire.numeroFogo, data: mov.data, responsavel: mov.responsavel, tipo: mov.tipo,
+    motivo, origem: orig, placaOrigem: placaO || "", posicaoOrigem: posO || "", destino: dest, placaDestino: placaD || "", posicaoDestino: posD || "",
+    kmMov: num(mov.kmMov), kmVida: km, recapadora: mov.recapadora || "", custoServicos: num(mov.valorBanda) || num(mov.custoServicos) || 0,
+    obs: mov.obs || "", vida: num(mov.tire.vida) || 1, criadoEm: nowISO(),
+  });
+  const mvLog = (tipo, t, v) => ({ montar: "Montou", desmontar: "Desmontou", rodizio: "Rodízio do", recapar: "Enviou p/ recapagem", descartar: "Descartou" }[tipo] + " pneu " + t.numeroFogo + (v ? " · " + v.prefixo : ""));
+
+  /* ---- análise de desgaste ---- */
   const submitWear = () => {
     if (!wear.pneuId || !(wear.tipos || []).length) return;
-    save({ wear: [...data.wear, { ...wear, id: uid(), criadoEm: nowISO() }] }, "Registrou desgaste · pneu " + (data.tires.find((t) => t.id === wear.pneuId)?.numeroFogo || ""));
+    save({ wear: [...data.wear, { ...wear, id: uid(), criadoEm: nowISO() }] }, "Registrou desgaste · pneu " + (tires.find((t) => t.id === wear.pneuId)?.numeroFogo || ""));
     setWear(null);
   };
 
-  const emUso = data.tires.filter((t) => t.status === "em_uso");
-  const custoKmMedio = (t) => { const k = km(t); return k > 0 && num(t.valor) > 0 ? num(t.valor) / k : 0; };
+  const movsOf = (tid) => (data.tiremoves || []).filter((m) => m.tireId === tid).sort((a, b) => String(b.criadoEm).localeCompare(String(a.criadoEm)));
 
   return (
     <div>
-      <PageHead title="Gestão de Pneus" sub={data.tires.length + " pneu(s) · " + emUso.length + " em uso"} actions={editable && <div className="flex gap-2"><Btn v="sec" onClick={() => setWear({ data: todayISO(), tipos: [] })} disabled={!emUso.length}><CircleDot size={15} /> Registrar desgaste</Btn><Btn onClick={startNew}><Plus size={16} /> Novo pneu</Btn></div>} />
-      <Tabs cur={tab} set={setTab} tabs={[["frota", "Todos os pneus"], ["uso", "Em uso (" + emUso.length + ")"], ["desgaste", "Análise de desgaste"]]} />
+      <PageHead title="Gestão de Pneus" sub={tires.length + " pneu(s) · " + emUso.length + " aplicados · " + estoque.length + " em estoque"} actions={<div className="flex gap-2 items-center"><HelpButton topic="inspecao" />{editable && <><Btn v="sec" onClick={() => setWear({ data: todayISO(), tipos: [] })} disabled={!emUso.length}><CircleDot size={15} /> Desgaste</Btn><Btn onClick={startNew}><Plus size={16} /> Novo pneu</Btn></>}</div>} />
+      <Tabs cur={tab} set={setTab} tabs={[["frota", "Todos (" + tires.length + ")"], ["uso", "Aplicados (" + emUso.length + ")"], ["estoque", "Estoque (" + estoque.length + ")"], ["previsao", "Previsão de troca"], ["desgaste", "Desgaste"], ["mov", "Movimentações"], ["descarte", "Descartados (" + descartados.length + ")"]]} />
 
-      {(tab === "frota" || tab === "uso") && (
-        (tab === "frota" ? data.tires : emUso).length === 0 ? <Empty icon={CircleDot} title="Nenhum pneu cadastrado" sub="Cadastre cada pneu com número de fogo para controlar montagem, rodízio, recapagem, vida útil e custo por km.">{editable && <Btn onClick={startNew}><Plus size={16} /> Cadastrar pneu</Btn>}</Empty>
-        : <DataTable onRow={editable ? setEdit : undefined}
+      {(tab === "frota" || tab === "uso" || tab === "estoque") && (() => {
+        const rows = tab === "uso" ? emUso : tab === "estoque" ? estoque : tires;
+        return rows.length === 0 ? <Empty icon={CircleDot} title="Nenhum pneu nesta aba" sub="Cadastre pneus por número de fogo para controlar vidas, sulcos, CPK, rodízio, recapagem e descarte.">{editable && <Btn onClick={startNew}><Plus size={16} /> Cadastrar pneu</Btn>}</Empty>
+        : <DataTable onRow={setView}
             cols={[
               { label: "Fogo", render: (t) => <span className="font-bold">{t.numeroFogo}</span> },
+              { label: "Vida", render: (t) => <Badge tone={num(t.vida) > 1 ? "amber" : "blue"}>{num(t.vida) || 1}ª</Badge> },
               { label: "Marca / Medida", render: (t) => <span className="text-slate-600 text-xs">{[t.marca, t.medida].filter(Boolean).join(" · ") || "—"}</span> },
-              { label: "Veículo / Pos.", render: (t) => t.status === "em_uso" ? (vmap[t.veiculoId]?.prefixo || "—") + " · " + (t.posicao || "?") : "—" },
-              { label: "KM rodado", right: true, render: (t) => fmtN(km(t)) },
-              { label: "Vida útil", render: (t) => { if (!num(t.vidaUtilKm)) return "—"; const p = Math.min(100, (km(t) / num(t.vidaUtilKm)) * 100); return <div className="w-24"><div className="h-1.5 bg-slate-200 rounded-full overflow-hidden"><div className="h-full rounded-full" style={{ width: p + "%", background: p > 90 ? BRAND.red : p > 70 ? BRAND.amber : BRAND.green }} /></div><span className="text-[10px] text-slate-500">{fmtN(p)}% usado</span></div>; } },
-              { label: "R$/km", right: true, render: (t) => custoKmMedio(t) ? fmtBRL(custoKmMedio(t)) : "—" },
+              { label: "Aplicação", render: (t) => t.status === "em_uso" ? <span className="text-xs">{vmap[t.veiculoId]?.prefixo || "—"} · <b>{t.posicao || "?"}</b></span> : "—" },
+              { label: "Menor sulco", right: true, render: (t) => { const s = menorSulco(t); return s == null ? "—" : <Badge tone={s < sulcoMin ? "red" : s < sulcoMin * 1.6 ? "amber" : "green"}>{fmtN(s, 1)} mm</Badge>; } },
+              { label: "KM vida", right: true, render: (t) => fmtN(kmVidaAtual(t, vmap)) },
+              { label: "CPK", right: true, render: (t) => { const c = cpkVidaAtual(t, vmap); return c ? fmtBRL(c) : "—"; } },
               { label: "Status", render: (t) => <Badge tone={TIRE_STATUS[t.status][1]}>{TIRE_STATUS[t.status][0]}</Badge> },
-              ...(editable ? [{ label: "Ações", render: (t) => t.status === "estoque" ? <Btn sm v="sec" onClick={(e) => { e.stopPropagation(); setMount({ tire: t, data: todayISO(), km: vmap[emUso[0]?.veiculoId]?.kmAtual || "" }); }}><ArrowRightLeft size={12} /> Montar</Btn> : t.status === "em_uso" ? <Btn sm v="sec" onClick={(e) => { e.stopPropagation(); if (confirm("Desmontar pneu " + t.numeroFogo + " e enviar para estoque?")) dismount(t, "estoque"); }}>Desmontar</Btn> : null }] : []),
             ]}
-            rows={tab === "frota" ? data.tires : emUso}
-          />
-      )}
+            rows={rows}
+          />;
+      })()}
+
+      {tab === "previsao" && (() => {
+        const base = emUso.map((t) => ({ t, prev: previsaoTroca(t, vmap, sulcoMin), menor: menorSulco(t) })).filter((x) => x.menor != null)
+          .sort((a, b) => (a.prev.kmRestante || 0) - (b.prev.kmRestante || 0));
+        return base.length === 0 ? <Empty icon={TrendingUp} title="Sem dados de previsão" sub="Registre inspeções de sulco nos pneus aplicados para o sistema calcular a previsão de troca." />
+        : <DataTable cols={[
+            { label: "Fogo", render: (x) => <span className="font-bold">{x.t.numeroFogo}</span> },
+            { label: "Veículo/Pos.", render: (x) => (vmap[x.t.veiculoId]?.prefixo || "—") + " · " + (x.t.posicao || "?") },
+            { label: "Menor sulco", right: true, render: (x) => <Badge tone={x.menor < sulcoMin ? "red" : x.menor < sulcoMin * 1.6 ? "amber" : "green"}>{fmtN(x.menor, 1)} mm</Badge> },
+            { label: "KM/mm", right: true, render: (x) => { const k = kmPorMm(x.t, vmap); return k ? fmtN(k) : "—"; } },
+            { label: "KM a rodar", right: true, render: (x) => x.prev.prazo ? <Badge tone="red">{x.prev.prazo}</Badge> : fmtN(x.prev.kmRestante) },
+          ]} rows={base} />;
+      })()}
 
       {tab === "desgaste" && (
         <div className="space-y-4">
-          <div className="bg-blue-50 border border-blue-200 rounded-xl p-3 text-xs text-blue-900 flex gap-2"><Info size={16} className="shrink-0 mt-0.5" /><span>Registre o padrão de desgaste observado. O sistema sugere causas prováveis (alinhamento, balanceamento, cambagem, calibragem, suspensão, carga) para corrigir antes de perder o pneu. Use a aba <b>IA</b> para um diagnóstico técnico detalhado.</span></div>
-          {data.wear.length === 0 ? <Empty icon={CircleDot} title="Nenhuma análise registrada" sub="Registre desgastes dos pneus em uso para receber sugestões de causa e correção.">{editable && emUso.length > 0 && <Btn onClick={() => setWear({ data: todayISO(), tipos: [] })}><Plus size={16} /> Registrar desgaste</Btn>}</Empty>
+          <div className="bg-blue-50 border border-blue-200 rounded-xl p-3 text-xs text-blue-900 flex gap-2"><Info size={16} className="shrink-0 mt-0.5" /><span>Registre o padrão de desgaste. O sistema sugere causas prováveis (alinhamento, balanceamento, calibragem, suspensão, carga). Use <b>IA › Diagnóstico de pneus</b> para um parecer técnico.</span></div>
+          {data.wear.length === 0 ? <Empty icon={CircleDot} title="Nenhuma análise registrada" sub="Registre desgastes dos pneus aplicados.">{editable && emUso.length > 0 && <Btn onClick={() => setWear({ data: todayISO(), tipos: [] })}><Plus size={16} /> Registrar desgaste</Btn>}</Empty>
           : <div className="space-y-2">
               {[...data.wear].sort((a, b) => String(b.data).localeCompare(String(a.data))).map((w) => {
-                const t = data.tires.find((x) => x.id === w.pneuId);
+                const t = tires.find((x) => x.id === w.pneuId);
                 const causas = [...new Set((w.tipos || []).flatMap((tp) => CAUSAS_DESGASTE[tp] || []))];
                 return (
                   <div key={w.id} className="bg-white rounded-xl border border-slate-200 p-3">
@@ -1495,41 +1617,70 @@ function Pneus({ data, save, user }) {
         </div>
       )}
 
+      {tab === "mov" && (
+        (data.tiremoves || []).length === 0 ? <Empty icon={ArrowRightLeft} title="Nenhuma movimentação registrada" sub="Montagem, rodízio, recapagem e descarte aparecem aqui com origem, destino, motivo e KM." />
+        : <DataTable cols={[
+            { label: "Data", render: (m) => fmtD(m.data) },
+            { label: "Fogo", render: (m) => <span className="font-semibold">{m.numeroFogo}</span> },
+            { label: "Movimentação", render: (m) => m.motivo },
+            { label: "Origem", render: (m) => [m.placaOrigem, m.posicaoOrigem].filter(Boolean).join(" · ") || TIRE_STATUS[m.origem]?.[0] || m.origem || "—" },
+            { label: "Destino", render: (m) => [m.placaDestino, m.posicaoDestino].filter(Boolean).join(" · ") || TIRE_STATUS[m.destino]?.[0] || m.destino || "—" },
+            { label: "KM", right: true, render: (m) => fmtN(m.kmMov) },
+            { label: "Resp.", render: (m) => m.responsavel || "—" },
+          ]} rows={[...(data.tiremoves || [])].sort((a, b) => String(b.criadoEm).localeCompare(String(a.criadoEm)))} />
+      )}
+
+      {tab === "descarte" && (
+        descartados.length === 0 ? <Empty icon={Trash2} title="Nenhum pneu descartado" sub="Pneus que chegaram ao fim da vida útil aparecem aqui com motivo, custo acumulado e CPK final." />
+        : <DataTable onRow={setView} cols={[
+            { label: "Fogo", render: (t) => <span className="font-bold">{t.numeroFogo}</span> },
+            { label: "Vidas", render: (t) => (num(t.vida) || 1) + "ª" },
+            { label: "Motivo", render: (t) => t.descarte?.motivo || "—" },
+            { label: "Data", render: (t) => fmtD(t.descarte?.data) },
+            { label: "KM total", right: true, render: (t) => fmtN(kmAcumuladoTotal(t, vmap)) },
+            { label: "CPK final", right: true, render: (t) => { const c = cpkAcumulado(t, vmap); return c ? fmtBRL(c) : "—"; } },
+          ]} rows={descartados} />
+      )}
+
+      {/* ---- modal cadastro ---- */}
       {edit && (
         <Modal title={edit.id ? "Editar pneu fogo " + edit.numeroFogo : "Novo pneu"} onClose={() => setEdit(null)} w="max-w-3xl"
           footer={<div className="flex justify-between w-full"><div>{edit.id && <Btn v="dan" sm onClick={() => del(edit)}><Trash2 size={13} /> Remover</Btn>}</div><div className="flex gap-2"><Btn v="sec" onClick={() => setEdit(null)}>Cancelar</Btn><Btn onClick={submit} disabled={!edit.numeroFogo}>Salvar</Btn></div></div>}>
           <div className="grid sm:grid-cols-2 gap-3">
             <Field label="Número de fogo" req><Inp value={edit.numeroFogo} onChange={(e) => setEdit({ ...edit, numeroFogo: e.target.value })} /></Field>
             <Field label="Status"><Sel value={edit.status} onChange={(e) => setEdit({ ...edit, status: e.target.value })}>{Object.entries(TIRE_STATUS).map(([k, v]) => <option key={k} value={k}>{v[0]}</option>)}</Sel></Field>
-            <Field label="Marca"><Inp value={edit.marca || ""} onChange={(e) => setEdit({ ...edit, marca: e.target.value })} /></Field>
-            <Field label="Modelo"><Inp value={edit.modelo || ""} onChange={(e) => setEdit({ ...edit, modelo: e.target.value })} /></Field>
-            <Field label="Medida"><Inp value={edit.medida || ""} onChange={(e) => setEdit({ ...edit, medida: e.target.value })} placeholder="295/80 R22.5" /></Field>
+            <Field label="Vida atual"><Sel value={edit.vida || 1} onChange={(e) => setEdit({ ...edit, vida: e.target.value })}>{[1, 2, 3, 4, 5].map((n) => <option key={n} value={n}>{vidaLabel(n)}</option>)}</Sel></Field>
+            <TireCatalogPicker value={{ marcaId: edit.marcaId, modeloId: edit.modeloId, medidaId: edit.medidaId }}
+              onChange={(patch) => setEdit((p) => {
+                const next = { ...p, ...patch };
+                // mantém os nomes em texto sincronizados (compatibilidade + relatórios)
+                if (patch.marcaId !== undefined) next.marca = brandName(data, patch.marcaId);
+                if (patch.modeloId !== undefined) next.modelo = modelName(data, patch.modeloId);
+                if (patch.medidaId !== undefined) next.medida = sizeName(data, patch.medidaId);
+                return next;
+              })} data={data} save={save} />
             <Field label="DOT"><Inp value={edit.dot || ""} onChange={(e) => setEdit({ ...edit, dot: e.target.value })} /></Field>
             <Field label="Nº de série"><Inp value={edit.serie || ""} onChange={(e) => setEdit({ ...edit, serie: e.target.value })} /></Field>
-            <Field label="Valor de compra"><Inp type="number" step="0.01" value={edit.valor || ""} onChange={(e) => setEdit({ ...edit, valor: e.target.value })} /></Field>
+            <Field label="Nota fiscal"><Inp value={edit.nf || ""} onChange={(e) => setEdit({ ...edit, nf: e.target.value })} /></Field>
+            <Field label="Valor de aquisição"><Inp type="number" step="0.01" value={edit.valor || ""} onChange={(e) => setEdit({ ...edit, valor: e.target.value })} /></Field>
             <Field label="Data de compra"><Inp type="date" value={edit.dataCompra || ""} onChange={(e) => setEdit({ ...edit, dataCompra: e.target.value })} /></Field>
+            <Field label="Sulco novo (mm)" hint="Profundidade de fábrica"><Inp type="number" step="0.1" value={edit.mmNovo || ""} onChange={(e) => setEdit({ ...edit, mmNovo: e.target.value })} placeholder="16" /></Field>
+            <Field label="Pressão ideal (PSI)"><Inp type="number" value={edit.pressaoIdeal || ""} onChange={(e) => setEdit({ ...edit, pressaoIdeal: e.target.value })} /></Field>
             <Field label="Vida útil estimada (km)"><Inp type="number" value={edit.vidaUtilKm || ""} onChange={(e) => setEdit({ ...edit, vidaUtilKm: e.target.value })} placeholder="120000" /></Field>
-            <Field label="KM já rodado (acumulado)"><Inp type="number" value={edit.kmAcumulado || ""} onChange={(e) => setEdit({ ...edit, kmAcumulado: e.target.value })} hint="Somado ao km rodado enquanto em uso" /></Field>
-            <Field label="Recapagens"><Inp type="number" value={edit.recapagens || ""} onChange={(e) => setEdit({ ...edit, recapagens: e.target.value })} /></Field>
           </div>
+          {num(edit.vida) > 1 && <div className="mt-3"><Field label="Valor da banda (recapagem atual)"><Inp type="number" step="0.01" value={edit.valorBanda || ""} onChange={(e) => setEdit({ ...edit, valorBanda: e.target.value })} /></Field></div>}
         </Modal>
       )}
-      {mount && (
-        <Modal title={"Montar pneu fogo " + mount.tire.numeroFogo} onClose={() => setMount(null)}
-          footer={<><Btn v="sec" onClick={() => setMount(null)}>Cancelar</Btn><Btn onClick={doMount} disabled={!mount.veiculoId || !mount.posicao}>Montar</Btn></>}>
-          <div className="grid sm:grid-cols-2 gap-3">
-            <Field label="Veículo" req><Sel value={mount.veiculoId || ""} onChange={(e) => setMount({ ...mount, veiculoId: e.target.value, km: vmap[e.target.value]?.kmAtual || mount.km })}><option value="">Selecione…</option>{data.vehicles.map((v) => <option key={v.id} value={v.id}>{v.prefixo} · {v.placa}</option>)}</Sel></Field>
-            <Field label="Posição" req><Sel value={mount.posicao || ""} onChange={(e) => setMount({ ...mount, posicao: e.target.value })}><option value="">Selecione…</option>{POSICOES.map((p) => <option key={p} value={p}>{p}</option>)}</Sel></Field>
-            <Field label="KM na montagem"><Inp type="number" value={mount.km || ""} onChange={(e) => setMount({ ...mount, km: e.target.value })} /></Field>
-            <Field label="Data"><Inp type="date" value={mount.data} onChange={(e) => setMount({ ...mount, data: e.target.value })} /></Field>
-          </div>
-        </Modal>
-      )}
+
+      {/* ---- modal movimentação ---- */}
+      {mov && <PneuMovModal mov={mov} setMov={setMov} doMov={doMov} data={data} vmap={vmap} />}
+
+      {/* ---- modal desgaste ---- */}
       {wear && (
         <Modal title="Registrar análise de desgaste" onClose={() => setWear(null)}
           footer={<><Btn v="sec" onClick={() => setWear(null)}>Cancelar</Btn><Btn onClick={submitWear} disabled={!wear.pneuId || !(wear.tipos || []).length}>Salvar</Btn></>}>
           <div className="space-y-3">
-            <Field label="Pneu (em uso)" req><Sel value={wear.pneuId || ""} onChange={(e) => setWear({ ...wear, pneuId: e.target.value })}><option value="">Selecione…</option>{emUso.map((t) => <option key={t.id} value={t.id}>Fogo {t.numeroFogo} · {vmap[t.veiculoId]?.prefixo} pos. {t.posicao}</option>)}</Sel></Field>
+            <Field label="Pneu (aplicado)" req><Sel value={wear.pneuId || ""} onChange={(e) => setWear({ ...wear, pneuId: e.target.value })}><option value="">Selecione…</option>{emUso.map((t) => <option key={t.id} value={t.id}>Fogo {t.numeroFogo} · {vmap[t.veiculoId]?.prefixo} pos. {t.posicao}</option>)}</Sel></Field>
             <Field label="Data"><Inp type="date" value={wear.data} onChange={(e) => setWear({ ...wear, data: e.target.value })} /></Field>
             <div>
               <span className="block text-xs font-semibold text-slate-600 mb-1.5">Padrões observados <span className="text-red-500">*</span></span>
@@ -1542,12 +1693,127 @@ function Pneus({ data, save, user }) {
                 ))}
               </div>
             </div>
+            <Field label="Aparência"><Sel value={wear.aparencia || ""} onChange={(e) => setWear({ ...wear, aparencia: e.target.value })}><option value="">—</option>{APARENCIA.map((a) => <option key={a} value={a}>{a}</option>)}</Sel></Field>
             {(wear.tipos || []).length > 0 && <div className="bg-amber-50 border border-amber-200 rounded-lg p-2.5 text-xs text-amber-900"><b>Causas prováveis:</b> {[...new Set((wear.tipos || []).flatMap((tp) => CAUSAS_DESGASTE[tp] || []))].join(" · ")}</div>}
             <Field label="Observações"><TA value={wear.obs || ""} onChange={(e) => setWear({ ...wear, obs: e.target.value })} /></Field>
           </div>
         </Modal>
       )}
+
+      {/* ---- ficha completa do pneu ---- */}
+      {view && <PneuFicha t={view} data={data} vmap={vmap} movs={movsOf(view.id)} editable={editable} sulcoMin={sulcoMin}
+        onClose={() => setView(null)} onEdit={() => { setEdit(view); setView(null); }} onMov={(tp) => { startMov(view, tp); setView(null); }} />}
     </div>
+  );
+}
+
+/* ---- Modal de movimentação (montar / rodízio / recapar / desmontar / descartar) ---- */
+function PneuMovModal({ mov, setMov, doMov, data, vmap }) {
+  const t = mov.tire;
+  const posDestino = mov.veiculoId ? posicoesDe(vmap[mov.veiculoId], data) : (t.veiculoId ? posicoesDe(vmap[t.veiculoId], data) : []);
+  const titulos = { montar: "Aplicar pneu (montagem)", desmontar: "Desmontar pneu", rodizio: "Rodízio de posição", recapar: "Enviar para recapagem", descartar: "Descartar pneu" };
+  const set = (k, v) => setMov({ ...mov, [k]: v });
+  const ok = mov.tipo === "montar" ? (mov.veiculoId && mov.posicao) : mov.tipo === "rodizio" ? mov.posicao : mov.tipo === "descartar" ? mov.motivoDescarte : true;
+  return (
+    <Modal title={titulos[mov.tipo] + " · fogo " + t.numeroFogo} onClose={() => setMov(null)}
+      footer={<><Btn v="sec" onClick={() => setMov(null)}>Cancelar</Btn><Btn onClick={doMov} disabled={!ok}>Confirmar</Btn></>}>
+      <div className="grid sm:grid-cols-2 gap-3">
+        <Field label="Data"><Inp type="date" value={mov.data} onChange={(e) => set("data", e.target.value)} /></Field>
+        <Field label="Responsável"><Inp value={mov.responsavel || ""} onChange={(e) => set("responsavel", e.target.value)} /></Field>
+        {mov.tipo === "montar" && <>
+          <Field label="Veículo" req><Sel value={mov.veiculoId || ""} onChange={(e) => set("veiculoId", e.target.value)}><option value="">Selecione…</option>{data.vehicles.map((v) => <option key={v.id} value={v.id}>{v.prefixo} · {v.placa}</option>)}</Sel></Field>
+          <Field label="Posição" req><Sel value={mov.posicao || ""} onChange={(e) => set("posicao", e.target.value)}><option value="">Selecione…</option>{posDestino.map((p) => <option key={p} value={p}>{p}</option>)}</Sel></Field>
+          <Field label="KM na montagem"><Inp type="number" value={mov.kmMov || ""} onChange={(e) => set("kmMov", e.target.value)} /></Field>
+        </>}
+        {mov.tipo === "rodizio" && <>
+          <Field label="Nova posição" req><Sel value={mov.posicao || ""} onChange={(e) => set("posicao", e.target.value)}><option value="">Selecione…</option>{posDestino.filter((p) => p !== t.posicao).map((p) => <option key={p} value={p}>{p}</option>)}</Sel></Field>
+          <Field label="KM atual"><Inp type="number" value={mov.kmMov || ""} onChange={(e) => set("kmMov", e.target.value)} /></Field>
+        </>}
+        {mov.tipo === "desmontar" && <>
+          <Field label="Destino"><Sel value={mov.destino || "estoque"} onChange={(e) => set("destino", e.target.value)}><option value="estoque">Estoque</option><option value="analise">Em análise</option><option value="conserto">Conserto</option></Sel></Field>
+          <Field label="Motivo"><Sel value={mov.motivo || ""} onChange={(e) => set("motivo", e.target.value)}><option value="">—</option>{MOV_MOTIVOS.map((m) => <option key={m} value={m}>{m}</option>)}</Sel></Field>
+          <Field label="KM atual"><Inp type="number" value={mov.kmMov || ""} onChange={(e) => set("kmMov", e.target.value)} /></Field>
+        </>}
+        {mov.tipo === "recapar" && <>
+          <Field label="Recapadora"><Inp value={mov.recapadora || ""} onChange={(e) => set("recapadora", e.target.value)} /></Field>
+          <Field label="Valor da banda (R$)"><Inp type="number" step="0.01" value={mov.valorBanda || ""} onChange={(e) => set("valorBanda", e.target.value)} /></Field>
+          <Field label="Sulco novo da banda (mm)"><Inp type="number" step="0.1" value={mov.mmNova || ""} onChange={(e) => set("mmNova", e.target.value)} /></Field>
+          <Field label="KM atual"><Inp type="number" value={mov.kmMov || ""} onChange={(e) => set("kmMov", e.target.value)} /></Field>
+          <div className="sm:col-span-2 bg-amber-50 border border-amber-200 rounded-lg p-2.5 text-xs text-amber-900"><Info size={13} className="inline" /> Ao recapar, a vida atual é encerrada (KM e custo registrados) e o pneu passa para a <b>{(num(t.vida) || 1) + 1}ª vida</b>.</div>
+        </>}
+        {mov.tipo === "descartar" && <>
+          <Field label="Motivo do descarte" req><Sel value={mov.motivoDescarte || ""} onChange={(e) => set("motivoDescarte", e.target.value)}><option value="">Selecione…</option>{DESCARTE_MOTIVOS.map((m) => <option key={m} value={m}>{m}</option>)}</Sel></Field>
+          <Field label="Aparência"><Sel value={mov.aparencia || ""} onChange={(e) => set("aparencia", e.target.value)}><option value="">—</option>{APARENCIA.map((a) => <option key={a} value={a}>{a}</option>)}</Sel></Field>
+          <Field label="Fotos do descarte" span={2}><PhotoInput label="Evidência" max={3} photos={mov.fotos || []} onChange={(ps) => set("fotos", ps)} /></Field>
+        </>}
+        <Field label="Observações" span={2}><TA value={mov.obs || ""} onChange={(e) => set("obs", e.target.value)} /></Field>
+      </div>
+    </Modal>
+  );
+}
+
+/* ---- Ficha completa do pneu (vidas, sulcos, CPK, histórico) ---- */
+function PneuFicha({ t, data, vmap, movs, editable, sulcoMin, onClose, onEdit, onMov }) {
+  const km = kmVidaAtual(t, vmap); const kmTot = kmAcumuladoTotal(t, vmap);
+  const cpk = cpkVidaAtual(t, vmap); const cpkAc = cpkAcumulado(t, vmap);
+  const menor = menorSulco(t); const prev = previsaoTroca(t, vmap, sulcoMin);
+  const aplicado = t.status === "em_uso"; const descartado = t.status === "sucateado";
+  const info = [
+    ["Status", TIRE_STATUS[t.status][0]], ["Vida atual", vidaLabel(num(t.vida) || 1)],
+    ["Marca / Modelo", [t.marca, t.modelo].filter(Boolean).join(" ") || "—"], ["Medida", t.medida || "—"],
+    ["DOT", t.dot || "—"], ["Nota fiscal", t.nf || "—"],
+    ...(aplicado ? [["Aplicado em", (vmap[t.veiculoId]?.prefixo || "") + " · pos. " + (t.posicao || "?")]] : []),
+  ];
+  return (
+    <Modal title={"Pneu fogo " + t.numeroFogo} sub={[t.marca, t.medida].filter(Boolean).join(" · ")} onClose={onClose} w="max-w-3xl"
+      footer={editable && <div className="flex flex-wrap gap-2 justify-end w-full">
+        {t.status === "estoque" && <Btn sm onClick={() => onMov("montar")}><ArrowRightLeft size={13} /> Aplicar</Btn>}
+        {aplicado && <><Btn sm v="sec" onClick={() => onMov("rodizio")}>Rodízio</Btn><Btn sm v="sec" onClick={() => onMov("desmontar")}>Desmontar</Btn></>}
+        {!descartado && <Btn sm v="sec" onClick={() => onMov("recapar")}>Recapar</Btn>}
+        {!descartado && <Btn sm v="dan" onClick={() => onMov("descartar")}>Descartar</Btn>}
+        <Btn sm v="sec" onClick={onEdit}><Pencil size={13} /> Editar</Btn>
+      </div>}>
+      <div className="space-y-4">
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-2">
+          <KPI icon={Gauge} tone="navy" label="Menor sulco" value={menor != null ? fmtN(menor, 1) + " mm" : "—"} sub={t.mmNovo ? "novo: " + t.mmNovo + " mm" : ""} />
+          <KPI icon={ArrowRightLeft} tone="royal" label="KM vida atual" value={fmtN(km)} sub={"total: " + fmtN(kmTot)} />
+          <KPI icon={Wallet} tone="amber" label="CPK vida" value={cpk ? fmtBRL(cpk) : "—"} sub={cpkAc ? "acum.: " + fmtBRL(cpkAc) : ""} />
+          <KPI icon={TrendingUp} tone="green" label="Previsão troca" value={prev.prazo || (prev.kmRestante ? fmtN(prev.kmRestante) + " km" : "—")} />
+        </div>
+        {aplicado && (
+          <div>
+            <h4 className="text-xs font-bold text-slate-600 mb-2 uppercase">Sulcos medidos (mm)</h4>
+            <div className="grid grid-cols-4 gap-2">
+              {SULCOS_POS.map(([k, lbl]) => <div key={k} className="bg-slate-50 rounded-lg p-2 text-center"><span className="block text-[10px] text-slate-400 uppercase">{lbl}</span><span className="font-bold text-slate-800">{num(t["sulco_" + k]) || "—"}</span></div>)}
+            </div>
+            <p className="text-[11px] text-slate-400 mt-1">Medições registradas via <b>Pneus › inspeção</b> ou módulo de Inspeção.</p>
+          </div>
+        )}
+        <div className="grid sm:grid-cols-2 gap-x-6 gap-y-1.5 bg-slate-50 rounded-xl p-4">
+          {info.map(([k, v]) => <div key={k} className="flex justify-between text-sm border-b border-slate-100 py-1"><span className="text-slate-500">{k}</span><span className="font-semibold text-slate-800 text-right">{v}</span></div>)}
+        </div>
+        {(t.historicoVidas || []).length > 0 && (
+          <div>
+            <h4 className="text-xs font-bold text-slate-600 mb-2 uppercase">Vidas anteriores</h4>
+            <div className="space-y-1">{t.historicoVidas.map((h, i) => <div key={i} className="flex justify-between text-xs bg-white border border-slate-200 rounded-lg px-3 py-1.5"><span>{vidaLabel(h.vida)}</span><span className="text-slate-500">{fmtN(h.km)} km{h.valorBanda ? " · banda " + fmtBRL(h.valorBanda) : ""}{h.sulcoFinal != null ? " · sulco final " + fmtN(h.sulcoFinal, 1) + "mm" : ""}</span></div>)}</div>
+          </div>
+        )}
+        {descartado && t.descarte && (
+          <div className="bg-red-50 border border-red-200 rounded-xl p-3">
+            <h4 className="text-xs font-bold text-red-700 mb-1 uppercase">Descarte</h4>
+            <p className="text-sm text-slate-700"><b>Motivo:</b> {t.descarte.motivo} · {fmtD(t.descarte.data)} · {t.descarte.responsavel}</p>
+            {t.descarte.obs && <p className="text-xs text-slate-500 mt-1">{t.descarte.obs}</p>}
+            {(t.descarte.fotos || []).length > 0 && <div className="mt-2"><PhotoStrip photos={t.descarte.fotos} onZoom={() => {}} /></div>}
+          </div>
+        )}
+        {movs.length > 0 && (
+          <div>
+            <h4 className="text-xs font-bold text-slate-600 mb-2 uppercase">Histórico de movimentações</h4>
+            <div className="space-y-1">{movs.map((m) => <div key={m.id} className="flex items-center gap-2 text-xs bg-white border border-slate-200 rounded-lg px-3 py-1.5"><span className="text-slate-400">{fmtD(m.data)}</span><span className="font-semibold flex-1">{m.motivo}</span>{m.kmMov ? <span className="text-slate-500">{fmtN(m.kmMov)} km</span> : null}</div>)}</div>
+          </div>
+        )}
+      </div>
+    </Modal>
   );
 }
 
@@ -1695,14 +1961,22 @@ function IAManual({ data, save }) {
 function IAPneu({ data }) {
   const [pneuId, setPneuId] = useState(""); const [loading, setLoading] = useState(false); const [out, setOut] = useState(null); const [err, setErr] = useState("");
   const vmap = Object.fromEntries(data.vehicles.map((v) => [v.id, v]));
-  const comDesgaste = data.tires.filter((t) => data.wear.some((w) => w.pneuId === t.id));
+  const comDesgaste = data.tires.filter((t) => data.wear.some((w) => w.pneuId === t.id) || menorSulco(t) != null);
   const run = async () => {
     setLoading(true); setErr(""); setOut(null);
     try {
       const t = data.tires.find((x) => x.id === pneuId);
       const wears = data.wear.filter((w) => w.pneuId === pneuId).sort((a, b) => String(b.data).localeCompare(String(a.data)));
-      const info = { fogo: t.numeroFogo, medida: t.medida, km: tireKm(t, vmap), vidaUtil: t.vidaUtilKm, veiculo: vmap[t.veiculoId]?.prefixo, posicao: t.posicao, desgastes: wears.map((w) => ({ data: w.data, padroes: (w.tipos || []).map((x) => DESGASTES[x]), obs: w.obs })) };
-      const prompt = "Você é um especialista em pneus de frota. Com base nos dados de desgaste abaixo, faça um diagnóstico técnico. Responda APENAS com JSON válido:\n{\"diagnostico\":\"análise técnica em 2-3 frases\",\"causas\":[{\"causa\":\"ex: desalinhamento\",\"probabilidade\":\"alta|média|baixa\"}],\"acoes\":[\"correção recomendada\"],\"urgencia\":\"alta|media|baixa\",\"vidaRestante\":\"estimativa em km ou %\"}\nDADOS:\n" + JSON.stringify(info) + "\nPortuguês do Brasil.";
+      const info = {
+        fogo: t.numeroFogo, medida: t.medida, marca: t.marca, vida: num(t.vida) || 1,
+        kmVidaAtual: kmVidaAtual(t, vmap), kmAcumulado: kmAcumuladoTotal(t, vmap), vidaUtilEstimada: t.vidaUtilKm,
+        veiculo: vmap[t.veiculoId]?.prefixo, posicao: t.posicao,
+        sulcoNovo: t.mmNovo, menorSulco: menorSulco(t), sulcos: { interno: t.sulco_interno, centroInt: t.sulco_centroInt, centroExt: t.sulco_centroExt, externo: t.sulco_externo },
+        kmPorMm: kmPorMm(t, vmap), cpkVida: +cpkVidaAtual(t, vmap).toFixed(4), cpkAcumulado: +cpkAcumulado(t, vmap).toFixed(4),
+        pressaoAtual: t.pressaoAtual, pressaoIdeal: t.pressaoIdeal,
+        desgastes: wears.map((w) => ({ data: w.data, padroes: (w.tipos || []).map((x) => DESGASTES[x]), aparencia: w.aparencia, obs: w.obs })),
+      };
+      const prompt = "Você é um especialista técnico em pneus de frota pesada. Faça um diagnóstico cruzando os dados: compare o sulco INTERNO vs EXTERNO (diferença grande indica desalinhamento/cambagem), o desgaste central vs ombros (indica calibragem alta/baixa), a pressão atual vs ideal, o CPK (custo por km — quanto maior, pior o aproveitamento) e os padrões de desgaste observados. Responda APENAS com JSON válido:\n{\"diagnostico\":\"análise técnica em 2-3 frases citando os números\",\"causas\":[{\"causa\":\"ex: desalinhamento (convergência)\",\"probabilidade\":\"alta|média|baixa\"}],\"acoes\":[\"correção recomendada\"],\"urgencia\":\"alta|media|baixa\",\"vidaRestante\":\"estimativa em km ou %\"}\nDADOS:\n" + JSON.stringify(info) + "\nPortuguês do Brasil.";
       const r = await askAI(prompt, true); setOut(r);
     } catch (e) { setErr(e.message); } finally { setLoading(false); }
   };
@@ -1751,7 +2025,7 @@ function Relatorios({ data }) {
     custos: { label: "Custos", cols: [{ k: "data", label: "Data", render: (r) => fmtD(r.data), csv: (r) => fmtD(r.data) }, { k: "categoria", label: "Categoria" }, { k: "veic", label: "Frota", render: (r) => vn(r.veiculoId), csv: (r) => vn(r.veiculoId) }, { k: "desc", label: "Descrição" }, { k: "valor", label: "Valor", right: true, render: (r) => fmtBRL(r.valor), csv: (r) => String(r.valor).replace(".", ",") }], rows: allCostRows(data).filter((r) => inRange(r.data) && matchV(r.veiculoId) && (!fCat || r.categoria === fCat)).sort((a, b) => String(b.data).localeCompare(String(a.data))), totalKey: "valor" },
     abast: { label: "Abastecimentos", cols: [{ k: "data", label: "Data", render: (r) => fmtD(r.data), csv: (r) => fmtD(r.data) }, { k: "veic", label: "Frota", render: (r) => vn(r.veiculoId), csv: (r) => vn(r.veiculoId) }, { k: "motorista", label: "Motorista" }, { k: "km", label: "KM", right: true, render: (r) => fmtN(r.km), csv: (r) => r.km }, { k: "litros", label: "Litros", right: true, render: (r) => fmtN(r.litros, 1), csv: (r) => r.litros }, { k: "kml", label: "km/l", right: true, render: (r) => enriched[r.id]?.kml ? fmtN(enriched[r.id].kml, 2) : "—", csv: (r) => enriched[r.id]?.kml ? enriched[r.id].kml.toFixed(2) : "" }, { k: "valorTotal", label: "Valor", right: true, render: (r) => fmtBRL(r.valorTotal), csv: (r) => String(r.valorTotal).replace(".", ",") }], rows: data.fuel.filter((r) => inRange(r.data) && matchV(r.veiculoId)).sort((a, b) => String(b.data).localeCompare(String(a.data))), totalKey: "valorTotal" },
     manut: { label: "Manutenções", cols: [{ k: "data", label: "Data", render: (r) => fmtD(r.data), csv: (r) => fmtD(r.data) }, { k: "veic", label: "Frota", render: (r) => vn(r.veiculoId), csv: (r) => vn(r.veiculoId) }, { k: "servicos", label: "Serviços" }, { k: "oficina", label: "Oficina" }, { k: "valor", label: "Valor", right: true, render: (r) => fmtBRL(r.valor), csv: (r) => String(r.valor).replace(".", ",") }], rows: data.mrecords.filter((r) => inRange(r.data) && matchV(r.veiculoId)).sort((a, b) => String(b.data).localeCompare(String(a.data))), totalKey: "valor" },
-    pneus: { label: "Pneus", cols: [{ k: "numeroFogo", label: "Fogo" }, { k: "marca", label: "Marca" }, { k: "medida", label: "Medida" }, { k: "veic", label: "Frota", render: (r) => r.status === "em_uso" ? vn(r.veiculoId) : "—", csv: (r) => r.status === "em_uso" ? vn(r.veiculoId) : "" }, { k: "km", label: "KM rodado", right: true, render: (r) => fmtN(tireKm(r, vmap)), csv: (r) => Math.round(tireKm(r, vmap)) }, { k: "status", label: "Status", render: (r) => TIRE_STATUS[r.status][0], csv: (r) => TIRE_STATUS[r.status][0] }], rows: data.tires.filter((r) => !fV || r.veiculoId === fV), totalKey: null },
+    pneus: { label: "Pneus", cols: [{ k: "numeroFogo", label: "Fogo" }, { k: "vida", label: "Vida", render: (r) => (num(r.vida) || 1) + "ª", csv: (r) => (num(r.vida) || 1) }, { k: "marca", label: "Marca" }, { k: "medida", label: "Medida" }, { k: "veic", label: "Frota", render: (r) => r.status === "em_uso" ? vn(r.veiculoId) : "—", csv: (r) => r.status === "em_uso" ? vn(r.veiculoId) : "" }, { k: "pos", label: "Pos.", render: (r) => r.posicao || "—", csv: (r) => r.posicao || "" }, { k: "sulco", label: "Menor sulco", right: true, render: (r) => { const s = menorSulco(r); return s == null ? "—" : fmtN(s, 1) + " mm"; }, csv: (r) => menorSulco(r) ?? "" }, { k: "km", label: "KM rodado", right: true, render: (r) => fmtN(tireKm(r, vmap)), csv: (r) => Math.round(tireKm(r, vmap)) }, { k: "cpk", label: "CPK", right: true, render: (r) => { const c = cpkAcumulado(r, vmap); return c ? fmtBRL(c) : "—"; }, csv: (r) => cpkAcumulado(r, vmap).toFixed(4) }, { k: "status", label: "Status", render: (r) => TIRE_STATUS[r.status][0], csv: (r) => TIRE_STATUS[r.status][0] }], rows: data.tires.filter((r) => !fV || r.veiculoId === fV), totalKey: null },
     checklist: { label: "Checklist", cols: [{ k: "data", label: "Data", render: (r) => fmtD(r.data), csv: (r) => fmtD(r.data) }, { k: "veic", label: "Frota", render: (r) => r.prefixo || vn(r.veiculoId), csv: (r) => r.prefixo || vn(r.veiculoId) }, { k: "usuario", label: "Responsável" }, { k: "km", label: "KM", right: true, render: (r) => fmtN(r.km), csv: (r) => r.km }, { k: "nc", label: "Não conformes", right: true, render: (r) => r.ncCount || 0, csv: (r) => r.ncCount || 0 }], rows: (data.checklists || []).filter((r) => inRange(r.data) && matchV(r.veiculoId)).sort((a, b) => String(b.data).localeCompare(String(a.data))), totalKey: null },
     calibragem: { label: "Calibragens", cols: [{ k: "data", label: "Data", render: (r) => fmtD(r.data), csv: (r) => fmtD(r.data) }, { k: "veic", label: "Frota", render: (r) => vn(r.veiculoId), csv: (r) => vn(r.veiculoId) }, { k: "responsavel", label: "Responsável" }, { k: "pos", label: "Pneus", render: (r) => Object.keys(r.pressoes || {}).filter((k) => r.pressoes[k]).length, csv: (r) => Object.keys(r.pressoes || {}).filter((k) => r.pressoes[k]).length }], rows: (data.calibrations || []).filter((r) => inRange(r.data) && matchV(r.veiculoId)).sort((a, b) => String(b.data).localeCompare(String(a.data))), totalKey: null },
   };
@@ -2556,7 +2830,17 @@ function Calibragem({ data, save, user }) {
   const vmap = Object.fromEntries(data.vehicles.map((v) => [v.id, v]));
   const cfg = { ...DEF_ALERTCFG, ...(data.settings.alertCfg || {}) };
   const start = () => setEdit({ veiculoId: fV || "", data: todayISO(), responsavel: user.nome, pressoes: {}, obs: "", fotos: [] });
-  const submit = () => { if (!edit.veiculoId) return; const list = edit.id ? data.calibrations.map((c) => c.id === edit.id ? edit : c) : [...data.calibrations, { ...edit, id: uid(), ts: nowISO() }]; save({ calibrations: list }, "Calibragem · " + (vmap[edit.veiculoId]?.prefixo || "")); setEdit(null); };
+  const submit = () => {
+    if (!edit.veiculoId) return;
+    const list = edit.id ? data.calibrations.map((c) => c.id === edit.id ? edit : c) : [...data.calibrations, { ...edit, id: uid(), ts: nowISO() }];
+    // Grava a pressão atual nos pneus aplicados (veículo+posição) — padrão Prolog
+    let tires = data.tires;
+    Object.entries(edit.pressoes || {}).forEach(([pos, psi]) => {
+      if (num(psi) > 0) { const t = tires.find((x) => x.status === "em_uso" && x.veiculoId === edit.veiculoId && x.posicao === pos); if (t) tires = tires.map((x) => x.id === t.id ? { ...x, pressaoAtual: num(psi), ultimaCalibragem: edit.data } : x); }
+    });
+    save({ calibrations: list, tires }, "Calibragem · " + (vmap[edit.veiculoId]?.prefixo || ""));
+    setEdit(null);
+  };
   const del = (c) => { if (!confirm("Remover esta calibragem?")) return; save({ calibrations: data.calibrations.filter((x) => x.id !== c.id) }, "Removeu calibragem"); setEdit(null); };
   const rows = [...data.calibrations].filter((c) => !fV || c.veiculoId === fV).sort((a, b) => String(b.data).localeCompare(String(a.data)));
   const lastByV = {}; data.calibrations.forEach((c) => { if (!lastByV[c.veiculoId] || c.data > lastByV[c.veiculoId].data) lastByV[c.veiculoId] = c; });
@@ -2607,7 +2891,22 @@ function Inspecao({ data, save, user }) {
   const vmap = Object.fromEntries(data.vehicles.map((v) => [v.id, v]));
   const cfg = { ...DEF_ALERTCFG, ...(data.settings.alertCfg || {}) };
   const start = () => setEdit({ veiculoId: fV || "", data: todayISO(), responsavel: user.nome, medicoes: [], obs: "", fotos: [] });
-  const submit = () => { if (!edit.veiculoId) return; const list = edit.id ? data.inspections.map((c) => c.id === edit.id ? edit : c) : [...data.inspections, { ...edit, id: uid(), ts: nowISO() }]; save({ inspections: list }, "Inspeção de pneus · " + (vmap[edit.veiculoId]?.prefixo || "")); setEdit(null); };
+  const submit = () => {
+    if (!edit.veiculoId) return;
+    const list = edit.id ? data.inspections.map((c) => c.id === edit.id ? edit : c) : [...data.inspections, { ...edit, id: uid(), ts: nowISO() }];
+    // Alimenta os sulcos medidos de volta nos pneus aplicados (veículo+posição) — padrão Prolog
+    const keys = ["interno", "centroInt", "centroExt", "externo"];
+    let tires = data.tires;
+    (edit.medicoes || []).forEach((m) => {
+      const t = tires.find((x) => x.status === "em_uso" && x.veiculoId === edit.veiculoId && x.posicao === m.pos);
+      if (t && (m.sulcos || []).some((s) => num(s) > 0)) {
+        const patch = { sulco_interno: m.sulcos[0] || "", sulco_centroInt: m.sulcos[1] || "", sulco_centroExt: m.sulcos[2] || "", sulco_externo: m.sulcos[3] || "", ultimaInspecao: edit.data };
+        tires = tires.map((x) => x.id === t.id ? { ...x, ...patch } : x);
+      }
+    });
+    save({ inspections: list, tires }, "Inspeção de pneus · " + (vmap[edit.veiculoId]?.prefixo || ""));
+    setEdit(null);
+  };
   const del = (c) => { if (!confirm("Remover esta inspeção?")) return; save({ inspections: data.inspections.filter((x) => x.id !== c.id) }, "Removeu inspeção"); setEdit(null); };
   const rows = [...data.inspections].filter((c) => !fV || c.veiculoId === fV).sort((a, b) => String(b.data).localeCompare(String(a.data)));
   const minSulco = (ins) => Math.min(...(ins.medicoes || []).flatMap((m) => (m.sulcos || []).map(num)).filter((x) => x > 0), 99);
@@ -2649,7 +2948,7 @@ function InspModal({ edit, setEdit, submit, del, data, vmap, cfg }) {
       {v && (posicoes.length === 0 ? <p className="text-xs text-slate-400 mb-3">Equipamento sem pneus.</p>
       : <div className="mb-3 overflow-x-auto">
           <table className="text-sm" style={{ minWidth: 460 }}>
-            <thead><tr className="text-[11px] text-slate-500 uppercase"><th className="text-left py-1 pr-3">Posição</th>{Array(nSulcos).fill(0).map((_, i) => <th key={i} className="px-1.5 py-1">Sulco {i + 1}</th>)}</tr></thead>
+            <thead><tr className="text-[11px] text-slate-500 uppercase"><th className="text-left py-1 pr-3">Posição</th>{Array(nSulcos).fill(0).map((_, i) => <th key={i} className="px-1.5 py-1">{nSulcos === 4 ? ["Interno", "Centro int.", "Centro ext.", "Externo"][i] : "Sulco " + (i + 1)}</th>)}</tr></thead>
             <tbody>{posicoes.map((p) => { const med = medOf(p); return <tr key={p} className="border-t border-slate-100"><td className="py-1.5 pr-3 font-bold text-slate-700">{p}</td>{Array(nSulcos).fill(0).map((_, i) => <td key={i} className="px-1"><input type="number" step="0.1" className="w-16 text-center rounded border border-slate-200 py-1 text-sm" placeholder="mm" value={(med.sulcos || [])[i] || ""} onChange={(e) => setSulco(p, i, e.target.value)} /></td>)}</tr>; })}</tbody>
           </table>
         </div>)}
@@ -2738,12 +3037,293 @@ function Configuracoes({ data, save }) {
 }
 
 /* ================= ADMINISTRAÇÃO (hub) ================= */
+/* ================= CATÁLOGO DE PNEUS (Marca → Modelo → Medida) ================= */
+// Helpers de acesso
+const brandName = (data, id) => (data.tireBrands || []).find((b) => b.id === id)?.nome || "";
+const modelName = (data, id) => (data.tireModels || []).find((m) => m.id === id)?.nome || "";
+const sizeName = (data, id) => (data.tireSizes || []).find((s) => s.id === id)?.nome || "";
+const modelsByBrand = (data, brandId) => (data.tireModels || []).filter((m) => m.marcaId === brandId);
+
+/* ---- Seletor reutilizável com busca + botão "+" inline (sem perder o form) ---- */
+function PickerPlus({ label, req, value, onChange, options, onCreate, placeholder, disabled, hint, renderOpt }) {
+  // options: [{id, nome, extra?}]
+  const [open, setOpen] = useState(false);
+  const [q, setQ] = useState("");
+  const ref = useRef();
+  const sel = options.find((o) => o.id === value);
+  useEffect(() => {
+    const h = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
+    document.addEventListener("mousedown", h); return () => document.removeEventListener("mousedown", h);
+  }, []);
+  const filt = options.filter((o) => (o.nome + " " + (o.extra || "")).toLowerCase().includes(q.toLowerCase()));
+  return (
+    <Field label={label} req={req} hint={hint}>
+      <div className="relative" ref={ref}>
+        <button type="button" disabled={disabled} onClick={() => setOpen((v) => !v)}
+          className={inpCls + " text-left flex items-center justify-between " + (disabled ? "opacity-50 cursor-not-allowed" : "")}>
+          <span className={sel ? "text-slate-900" : "text-slate-400"}>{sel ? (renderOpt ? renderOpt(sel) : sel.nome) : (placeholder || "Selecione…")}</span>
+          <ChevronDown size={15} className="text-slate-400 shrink-0" />
+        </button>
+        {open && !disabled && (
+          <div className="absolute z-30 mt-1 w-full bg-white border border-slate-200 rounded-lg shadow-lg max-h-64 overflow-hidden flex flex-col">
+            <div className="p-2 border-b border-slate-100">
+              <div className="relative"><Search size={14} className="absolute left-2.5 top-2.5 text-slate-400" /><input autoFocus className={inpCls + " pl-8 py-1.5"} placeholder="Buscar…" value={q} onChange={(e) => setQ(e.target.value)} /></div>
+            </div>
+            <div className="overflow-y-auto">
+              {filt.length === 0 && <p className="text-xs text-slate-400 px-3 py-3 text-center">Nenhum resultado.</p>}
+              {filt.map((o) => (
+                <button key={o.id} type="button" onClick={() => { onChange(o.id); setOpen(false); setQ(""); }}
+                  className={"w-full text-left px-3 py-2 text-sm hover:bg-blue-50 flex items-center justify-between " + (o.id === value ? "bg-blue-50 font-semibold" : "")}>
+                  <span>{renderOpt ? renderOpt(o) : o.nome}</span>{o.id === value && <Check size={14} className="text-blue-600" />}
+                </button>
+              ))}
+            </div>
+            {onCreate && (
+              <button type="button" onClick={() => { setOpen(false); onCreate(q); setQ(""); }}
+                className="border-t border-slate-100 px-3 py-2 text-sm font-bold text-blue-700 hover:bg-blue-50 flex items-center gap-1.5">
+                <Plus size={14} /> Cadastrar {q ? "“" + q + "”" : "novo"}
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+    </Field>
+  );
+}
+
+/* ---- Modais rápidos de criação (usados inline no cadastro de pneu) ---- */
+function BrandQuickModal({ initial, data, save, onDone, onCancel }) {
+  const [v, setV] = useState({ nome: initial || "", codigo: "", logo: [] });
+  const submit = () => {
+    if (!v.nome.trim()) return;
+    if ((data.tireBrands || []).some((b) => b.nome.trim().toLowerCase() === v.nome.trim().toLowerCase())) { alert("Já existe uma marca com esse nome."); return; }
+    const rec = { id: uid(), nome: v.nome.trim(), codigo: v.codigo.trim(), logo: (v.logo || [])[0] || "", criadoEm: nowISO() };
+    save({ tireBrands: [...(data.tireBrands || []), rec] }, "Cadastrou marca de pneu " + rec.nome);
+    onDone(rec.id);
+  };
+  return (
+    <Modal title="Cadastrar marca" onClose={onCancel} w="max-w-md"
+      footer={<><Btn v="sec" onClick={onCancel}>Cancelar</Btn><Btn onClick={submit} disabled={!v.nome.trim()}>Salvar</Btn></>}>
+      <div className="space-y-3">
+        <Field label="Nome da marca" req><Inp autoFocus value={v.nome} onChange={(e) => setV({ ...v, nome: e.target.value })} placeholder="Ex.: Michelin" /></Field>
+        <Field label="Código auxiliar"><Inp value={v.codigo} onChange={(e) => setV({ ...v, codigo: e.target.value })} /></Field>
+        <Field label="Logotipo (opcional)"><PhotoInput label="Logo da marca" max={1} photos={v.logo} onChange={(ps) => setV({ ...v, logo: ps })} /></Field>
+      </div>
+    </Modal>
+  );
+}
+function ModelQuickModal({ initial, marcaId, data, save, onDone, onCancel }) {
+  const [v, setV] = useState({ nome: initial || "", marcaId: marcaId || "", desenho: "", qtdSulcos: "", mmNovo: "", codigo: "" });
+  const submit = () => {
+    if (!v.nome.trim() || !v.marcaId) return;
+    if ((data.tireModels || []).some((m) => m.marcaId === v.marcaId && m.nome.trim().toLowerCase() === v.nome.trim().toLowerCase())) { alert("Essa marca já tem um modelo com esse nome."); return; }
+    const rec = { id: uid(), nome: v.nome.trim(), marcaId: v.marcaId, desenho: v.desenho, qtdSulcos: num(v.qtdSulcos) || "", mmNovo: num(v.mmNovo) || "", codigo: v.codigo.trim(), criadoEm: nowISO() };
+    save({ tireModels: [...(data.tireModels || []), rec] }, "Cadastrou modelo de pneu " + rec.nome);
+    onDone(rec.id);
+  };
+  const brands = (data.tireBrands || []).map((b) => ({ id: b.id, nome: b.nome }));
+  return (
+    <Modal title="Cadastrar modelo" sub="Todo modelo pertence a uma marca" onClose={onCancel} w="max-w-lg"
+      footer={<><Btn v="sec" onClick={onCancel}>Cancelar</Btn><Btn onClick={submit} disabled={!v.nome.trim() || !v.marcaId}>Salvar</Btn></>}>
+      <div className="grid sm:grid-cols-2 gap-3">
+        <div className="sm:col-span-2"><Field label="Marca vinculada" req><Sel value={v.marcaId} onChange={(e) => setV({ ...v, marcaId: e.target.value })}><option value="">Selecione a marca…</option>{brands.map((b) => <option key={b.id} value={b.id}>{b.nome}</option>)}</Sel></Field></div>
+        <div className="sm:col-span-2"><Field label="Nome do modelo" req><Inp autoFocus value={v.nome} onChange={(e) => setV({ ...v, nome: e.target.value })} placeholder="Ex.: X Multi Z" /></Field></div>
+        <Field label="Desenho / banda"><Inp list="dl-desenho" value={v.desenho} onChange={(e) => setV({ ...v, desenho: e.target.value })} placeholder="Liso, Misto…" /><datalist id="dl-desenho">{DESENHOS_PNEU.map((d) => <option key={d} value={d} />)}</datalist></Field>
+        <Field label="Qtd. de sulcos"><Inp type="number" value={v.qtdSulcos} onChange={(e) => setV({ ...v, qtdSulcos: e.target.value })} /></Field>
+        <Field label="Sulco novo (mm)"><Inp type="number" step="0.1" value={v.mmNovo} onChange={(e) => setV({ ...v, mmNovo: e.target.value })} placeholder="16" /></Field>
+        <Field label="Código auxiliar"><Inp value={v.codigo} onChange={(e) => setV({ ...v, codigo: e.target.value })} /></Field>
+      </div>
+      {!v.marcaId && (data.tireBrands || []).length === 0 && <p className="text-xs text-amber-700 mt-2"><Info size={12} className="inline" /> Cadastre uma marca primeiro (em Administração › Pneus: Marcas).</p>}
+    </Modal>
+  );
+}
+function SizeQuickModal({ initial, data, save, onDone, onCancel }) {
+  const [v, setV] = useState({ nome: initial || "" });
+  const norm = (s) => s.trim().toUpperCase().replace(/\s+/g, " ");
+  const submit = () => {
+    if (!v.nome.trim()) return;
+    const n = norm(v.nome);
+    if ((data.tireSizes || []).some((s) => norm(s.nome) === n)) { alert("Essa medida já está cadastrada."); return; }
+    const rec = { id: uid(), nome: n, criadoEm: nowISO() };
+    save({ tireSizes: [...(data.tireSizes || []), rec] }, "Cadastrou medida de pneu " + rec.nome);
+    onDone(rec.id);
+  };
+  return (
+    <Modal title="Cadastrar medida" sub="Padronizada para evitar duplicidade" onClose={onCancel} w="max-w-md"
+      footer={<><Btn v="sec" onClick={onCancel}>Cancelar</Btn><Btn onClick={submit} disabled={!v.nome.trim()}>Salvar</Btn></>}>
+      <Field label="Medida" req><Inp autoFocus value={v.nome} onChange={(e) => setV({ ...v, nome: e.target.value })} placeholder="Ex.: 295/80 R22.5" /></Field>
+      <p className="text-[11px] text-slate-400 mt-2">A medida é padronizada em maiúsculas e pode ser reutilizada em qualquer marca/modelo.</p>
+    </Modal>
+  );
+}
+
+/* ---- Trio de seletores em cascata (Marca → Modelo → Medida) com + inline ---- */
+// Uso: <TireCatalogPicker value={{marcaId,modeloId,medidaId}} onChange={(patch)=>...} data={data} save={save} />
+function TireCatalogPicker({ value, onChange, data, save }) {
+  const [quick, setQuick] = useState(null); // {tipo:'brand'|'model'|'size', initial}
+  const brands = (data.tireBrands || []).map((b) => ({ id: b.id, nome: b.nome, extra: b.codigo }));
+  const models = modelsByBrand(data, value.marcaId).map((m) => ({ id: m.id, nome: m.nome, extra: m.desenho }));
+  const sizes = (data.tireSizes || []).map((s) => ({ id: s.id, nome: s.nome }));
+  return (
+    <>
+      <PickerPlus label="Marca" req value={value.marcaId || ""} options={brands}
+        onChange={(id) => onChange({ marcaId: id, modeloId: "" })}
+        onCreate={(txt) => setQuick({ tipo: "brand", initial: txt })} placeholder="Selecione a marca" />
+      <PickerPlus label="Modelo" req value={value.modeloId || ""} options={models} disabled={!value.marcaId}
+        onChange={(id) => { const m = (data.tireModels || []).find((x) => x.id === id); onChange({ modeloId: id, ...(m && m.mmNovo ? { mmNovo: m.mmNovo } : {}) }); }}
+        onCreate={(txt) => setQuick({ tipo: "model", initial: txt })}
+        placeholder={value.marcaId ? "Selecione o modelo" : "Escolha a marca primeiro"}
+        hint={value.marcaId ? "Mostrando modelos da marca selecionada" : null}
+        renderOpt={(o) => o.nome + (o.extra ? " · " + o.extra : "")} />
+      <PickerPlus label="Medida" req value={value.medidaId || ""} options={sizes}
+        onChange={(id) => onChange({ medidaId: id })}
+        onCreate={(txt) => setQuick({ tipo: "size", initial: txt })} placeholder="Selecione a medida" />
+
+      {quick?.tipo === "brand" && <BrandQuickModal initial={quick.initial} data={data} save={save} onCancel={() => setQuick(null)} onDone={(id) => { onChange({ marcaId: id, modeloId: "" }); setQuick(null); }} />}
+      {quick?.tipo === "model" && <ModelQuickModal initial={quick.initial} marcaId={value.marcaId} data={data} save={save} onCancel={() => setQuick(null)} onDone={(id) => { onChange({ modeloId: id }); setQuick(null); }} />}
+      {quick?.tipo === "size" && <SizeQuickModal initial={quick.initial} data={data} save={save} onCancel={() => setQuick(null)} onDone={(id) => { onChange({ medidaId: id }); setQuick(null); }} />}
+    </>
+  );
+}
+
+/* ================= ADMIN: CADASTRO DE MARCAS ================= */
+function CadMarcas({ data, save }) {
+  const [edit, setEdit] = useState(null); const [q, setQ] = useState(""); const [zoom, setZoom] = useState(null);
+  const rows = (data.tireBrands || []).filter((b) => (b.nome + " " + (b.codigo || "")).toLowerCase().includes(q.toLowerCase()));
+  const submit = () => {
+    if (!edit.nome.trim()) return;
+    if ((data.tireBrands || []).some((b) => b.id !== edit.id && b.nome.trim().toLowerCase() === edit.nome.trim().toLowerCase())) { alert("Já existe uma marca com esse nome."); return; }
+    const rec = { ...edit, nome: edit.nome.trim(), logo: (edit.logoArr || [])[0] ?? edit.logo ?? "" }; delete rec.logoArr;
+    const list = edit.id ? data.tireBrands.map((b) => b.id === edit.id ? rec : b) : [...(data.tireBrands || []), { ...rec, id: uid(), criadoEm: nowISO() }];
+    save({ tireBrands: list }, (edit.id ? "Editou" : "Cadastrou") + " marca de pneu " + rec.nome); setEdit(null);
+  };
+  const del = (b) => {
+    const emUso = (data.tireModels || []).some((m) => m.marcaId === b.id) || (data.tires || []).some((t) => t.marcaId === b.id);
+    if (emUso) { alert("Não é possível remover: existem modelos ou pneus vinculados a esta marca."); return; }
+    if (!confirm("Remover a marca " + b.nome + "?")) return;
+    save({ tireBrands: data.tireBrands.filter((x) => x.id !== b.id) }, "Removeu marca " + b.nome);
+  };
+  return (
+    <div>
+      <div className="flex items-center justify-between gap-2 mb-3"><h3 className="font-bold text-slate-800">Marcas de pneus</h3><Btn sm onClick={() => setEdit({ nome: "", codigo: "", logoArr: [] })}><Plus size={14} /> Cadastrar marca</Btn></div>
+      <div className="relative mb-3 max-w-sm"><Search size={15} className="absolute left-3 top-2.5 text-slate-400" /><input className={inpCls + " pl-9"} placeholder="Buscar marca…" value={q} onChange={(e) => setQ(e.target.value)} /></div>
+      {(data.tireBrands || []).length === 0 ? <Empty icon={Package} title="Nenhuma marca cadastrada" sub="Cadastre as marcas de pneu (Michelin, Pirelli, Goodyear…) para reutilizar nos modelos e pneus.">{<Btn onClick={() => setEdit({ nome: "", codigo: "", logoArr: [] })}><Plus size={16} /> Cadastrar marca</Btn>}</Empty>
+      : <DataTable onRow={(b) => setEdit({ ...b, logoArr: b.logo ? [b.logo] : [] })} cols={[
+          { label: "Logo", render: (b) => b.logo ? <img src={b.logo} onClick={(e) => { e.stopPropagation(); setZoom(b.logo); }} className="w-8 h-8 rounded object-contain bg-slate-50 cursor-zoom-in" /> : <span className="text-slate-300">—</span> },
+          { label: "Marca", render: (b) => <span className="font-semibold">{b.nome}</span> },
+          { label: "Código", render: (b) => b.codigo || "—" },
+          { label: "Modelos", right: true, render: (b) => modelsByBrand(data, b.id).length },
+          { label: "", right: true, render: (b) => <button onClick={(e) => { e.stopPropagation(); del(b); }} className="text-slate-400 hover:text-red-500"><Trash2 size={14} /></button> },
+        ]} rows={rows} />}
+      {edit && <Modal title={edit.id ? "Editar marca" : "Cadastrar marca"} onClose={() => setEdit(null)} w="max-w-md"
+        footer={<><Btn v="sec" onClick={() => setEdit(null)}>Cancelar</Btn><Btn onClick={submit} disabled={!edit.nome.trim()}>Salvar</Btn></>}>
+        <div className="space-y-3">
+          <Field label="Nome da marca" req><Inp autoFocus value={edit.nome} onChange={(e) => setEdit({ ...edit, nome: e.target.value })} placeholder="Ex.: Michelin" /></Field>
+          <Field label="Código auxiliar"><Inp value={edit.codigo || ""} onChange={(e) => setEdit({ ...edit, codigo: e.target.value })} /></Field>
+          <Field label="Logotipo (opcional)"><PhotoInput label="Logo da marca" max={1} photos={edit.logoArr || []} onChange={(ps) => setEdit({ ...edit, logoArr: ps })} /></Field>
+        </div>
+      </Modal>}
+      {zoom && <Lightbox src={zoom} onClose={() => setZoom(null)} />}
+    </div>
+  );
+}
+
+/* ================= ADMIN: CADASTRO DE MODELOS ================= */
+function CadModelos({ data, save }) {
+  const [edit, setEdit] = useState(null); const [q, setQ] = useState(""); const [fMarca, setFMarca] = useState("");
+  const rows = (data.tireModels || []).filter((m) => (!fMarca || m.marcaId === fMarca) && (m.nome + " " + (m.codigo || "") + " " + brandName(data, m.marcaId)).toLowerCase().includes(q.toLowerCase()));
+  const submit = () => {
+    if (!edit.nome.trim() || !edit.marcaId) return;
+    if ((data.tireModels || []).some((m) => m.id !== edit.id && m.marcaId === edit.marcaId && m.nome.trim().toLowerCase() === edit.nome.trim().toLowerCase())) { alert("Essa marca já tem um modelo com esse nome."); return; }
+    const rec = { ...edit, nome: edit.nome.trim(), qtdSulcos: num(edit.qtdSulcos) || "", mmNovo: num(edit.mmNovo) || "" };
+    const list = edit.id ? data.tireModels.map((m) => m.id === edit.id ? rec : m) : [...(data.tireModels || []), { ...rec, id: uid(), criadoEm: nowISO() }];
+    save({ tireModels: list }, (edit.id ? "Editou" : "Cadastrou") + " modelo de pneu " + rec.nome); setEdit(null);
+  };
+  const del = (m) => {
+    if ((data.tires || []).some((t) => t.modeloId === m.id)) { alert("Não é possível remover: existem pneus vinculados a este modelo."); return; }
+    if (!confirm("Remover o modelo " + m.nome + "?")) return;
+    save({ tireModels: data.tireModels.filter((x) => x.id !== m.id) }, "Removeu modelo " + m.nome);
+  };
+  const semMarca = (data.tireBrands || []).length === 0;
+  return (
+    <div>
+      <div className="flex items-center justify-between gap-2 mb-3"><h3 className="font-bold text-slate-800">Modelos de pneus</h3><Btn sm onClick={() => setEdit({ nome: "", marcaId: fMarca || "", desenho: "", qtdSulcos: "", mmNovo: "", codigo: "" })} disabled={semMarca}><Plus size={14} /> Cadastrar modelo</Btn></div>
+      {semMarca && <div className="bg-amber-50 border border-amber-200 rounded-lg p-2.5 text-xs text-amber-900 mb-3 flex gap-2"><Info size={14} className="shrink-0 mt-0.5" /><span>Cadastre ao menos uma <b>marca</b> antes de criar modelos — todo modelo pertence a uma marca.</span></div>}
+      <div className="flex gap-2 mb-3 flex-wrap">
+        <div className="relative flex-1 min-w-[180px]"><Search size={15} className="absolute left-3 top-2.5 text-slate-400" /><input className={inpCls + " pl-9"} placeholder="Buscar modelo…" value={q} onChange={(e) => setQ(e.target.value)} /></div>
+        <Sel value={fMarca} onChange={(e) => setFMarca(e.target.value)}><option value="">Todas as marcas</option>{(data.tireBrands || []).map((b) => <option key={b.id} value={b.id}>{b.nome}</option>)}</Sel>
+      </div>
+      {(data.tireModels || []).length === 0 ? <Empty icon={Package} title="Nenhum modelo cadastrado" sub="Cadastre modelos vinculados a uma marca, com desenho, sulcos e profundidade quando novo." />
+      : <DataTable onRow={setEdit} cols={[
+          { label: "Modelo", render: (m) => <span className="font-semibold">{m.nome}</span> },
+          { label: "Marca", render: (m) => <Badge tone="navy">{brandName(data, m.marcaId)}</Badge> },
+          { label: "Desenho", render: (m) => m.desenho || "—" },
+          { label: "Sulcos", right: true, render: (m) => m.qtdSulcos || "—" },
+          { label: "Sulco novo", right: true, render: (m) => m.mmNovo ? m.mmNovo + " mm" : "—" },
+          { label: "", right: true, render: (m) => <button onClick={(e) => { e.stopPropagation(); del(m); }} className="text-slate-400 hover:text-red-500"><Trash2 size={14} /></button> },
+        ]} rows={rows} />}
+      {edit && <Modal title={edit.id ? "Editar modelo" : "Cadastrar modelo"} sub="Todo modelo pertence a uma marca" onClose={() => setEdit(null)} w="max-w-lg"
+        footer={<><Btn v="sec" onClick={() => setEdit(null)}>Cancelar</Btn><Btn onClick={submit} disabled={!edit.nome.trim() || !edit.marcaId}>Salvar</Btn></>}>
+        <div className="grid sm:grid-cols-2 gap-3">
+          <div className="sm:col-span-2"><Field label="Marca vinculada" req><Sel value={edit.marcaId} onChange={(e) => setEdit({ ...edit, marcaId: e.target.value })}><option value="">Selecione a marca…</option>{(data.tireBrands || []).map((b) => <option key={b.id} value={b.id}>{b.nome}</option>)}</Sel></Field></div>
+          <div className="sm:col-span-2"><Field label="Nome do modelo" req><Inp value={edit.nome} onChange={(e) => setEdit({ ...edit, nome: e.target.value })} placeholder="Ex.: X Multi Z" /></Field></div>
+          <Field label="Desenho / banda"><Inp list="dl-desenho2" value={edit.desenho || ""} onChange={(e) => setEdit({ ...edit, desenho: e.target.value })} placeholder="Liso, Misto…" /><datalist id="dl-desenho2">{DESENHOS_PNEU.map((d) => <option key={d} value={d} />)}</datalist></Field>
+          <Field label="Qtd. de sulcos"><Inp type="number" value={edit.qtdSulcos || ""} onChange={(e) => setEdit({ ...edit, qtdSulcos: e.target.value })} /></Field>
+          <Field label="Sulco novo (mm)"><Inp type="number" step="0.1" value={edit.mmNovo || ""} onChange={(e) => setEdit({ ...edit, mmNovo: e.target.value })} placeholder="16" /></Field>
+          <Field label="Código auxiliar"><Inp value={edit.codigo || ""} onChange={(e) => setEdit({ ...edit, codigo: e.target.value })} /></Field>
+        </div>
+      </Modal>}
+    </div>
+  );
+}
+
+/* ================= ADMIN: CADASTRO DE MEDIDAS ================= */
+function CadMedidas({ data, save }) {
+  const [edit, setEdit] = useState(null); const [q, setQ] = useState("");
+  const norm = (s) => s.trim().toUpperCase().replace(/\s+/g, " ");
+  const rows = (data.tireSizes || []).filter((s) => s.nome.toLowerCase().includes(q.toLowerCase()));
+  const submit = () => {
+    if (!edit.nome.trim()) return;
+    const n = norm(edit.nome);
+    if ((data.tireSizes || []).some((s) => s.id !== edit.id && norm(s.nome) === n)) { alert("Essa medida já está cadastrada."); return; }
+    const rec = { ...edit, nome: n };
+    const list = edit.id ? data.tireSizes.map((s) => s.id === edit.id ? rec : s) : [...(data.tireSizes || []), { ...rec, id: uid(), criadoEm: nowISO() }];
+    save({ tireSizes: list }, (edit.id ? "Editou" : "Cadastrou") + " medida de pneu " + rec.nome); setEdit(null);
+  };
+  const del = (s) => {
+    if ((data.tires || []).some((t) => t.medidaId === s.id)) { alert("Não é possível remover: existem pneus com esta medida."); return; }
+    if (!confirm("Remover a medida " + s.nome + "?")) return;
+    save({ tireSizes: data.tireSizes.filter((x) => x.id !== s.id) }, "Removeu medida " + s.nome);
+  };
+  const usoCount = (sid) => (data.tires || []).filter((t) => t.medidaId === sid).length;
+  return (
+    <div>
+      <div className="flex items-center justify-between gap-2 mb-3"><h3 className="font-bold text-slate-800">Medidas de pneus</h3><Btn sm onClick={() => setEdit({ nome: "" })}><Plus size={14} /> Cadastrar medida</Btn></div>
+      <div className="relative mb-3 max-w-sm"><Search size={15} className="absolute left-3 top-2.5 text-slate-400" /><input className={inpCls + " pl-9"} placeholder="Buscar medida…" value={q} onChange={(e) => setQ(e.target.value)} /></div>
+      {(data.tireSizes || []).length === 0 ? <Empty icon={CircleDot} title="Nenhuma medida cadastrada" sub="Cadastre as medidas (ex.: 295/80 R22.5) uma vez e reutilize em qualquer marca e modelo.">{<Btn onClick={() => setEdit({ nome: "" })}><Plus size={16} /> Cadastrar medida</Btn>}</Empty>
+      : <DataTable onRow={setEdit} cols={[
+          { label: "Medida", render: (s) => <span className="font-semibold">{s.nome}</span> },
+          { label: "Pneus com esta medida", right: true, render: (s) => usoCount(s.id) },
+          { label: "", right: true, render: (s) => <button onClick={(e) => { e.stopPropagation(); del(s); }} className="text-slate-400 hover:text-red-500"><Trash2 size={14} /></button> },
+        ]} rows={rows} />}
+      {edit && <Modal title={edit.id ? "Editar medida" : "Cadastrar medida"} sub="Padronizada para evitar duplicidade" onClose={() => setEdit(null)} w="max-w-md"
+        footer={<><Btn v="sec" onClick={() => setEdit(null)}>Cancelar</Btn><Btn onClick={submit} disabled={!edit.nome.trim()}>Salvar</Btn></>}>
+        <Field label="Medida" req><Inp autoFocus value={edit.nome} onChange={(e) => setEdit({ ...edit, nome: e.target.value })} placeholder="Ex.: 295/80 R22.5" /></Field>
+        <p className="text-[11px] text-slate-400 mt-2">Será padronizada em maiúsculas. Reutilizável em qualquer marca/modelo.</p>
+      </Modal>}
+    </div>
+  );
+}
+
 function Administracao({ data, save, user, sub }) {
   // sub define qual sub-tela renderizar
   switch (sub) {
     case "combustiveis": return <CadCombustiveis data={data} save={save} />;
     case "diagramas": return <CadDiagramas data={data} save={save} />;
     case "tiposequip": return <CadTiposEquip data={data} save={save} />;
+    case "marcas": return <CadMarcas data={data} save={save} />;
+    case "modelos": return <CadModelos data={data} save={save} />;
+    case "medidas": return <CadMedidas data={data} save={save} />;
     case "config": return <Configuracoes data={data} save={save} />;
     default: return null;
   }
@@ -2754,7 +3334,7 @@ function Administracao({ data, save, user, sub }) {
 const NAVGROUPS = [
   { id: "g-inicio", label: "Início", icon: LayoutDashboard, items: [["dash", "Dashboard", "dash"], ["minhas", "Minhas Pendências", "checklist"]] },
   { id: "g-frotas", label: "Frotas", icon: Truck, items: [["veiculos", "Cadastro", "veiculos"], ["checklist", "Checklist", "checklist"], ["resumo", "Resumo Checklists", "resumo"], ["abast", "Abastecimento", "abast"], ["custos", "Custos", "custos"], ["manut", "Manutenções", "manut"], ["os", "Ordens de Serviço", "os"], ["documentacao", "Documentação", "veiculos"], ["timeline", "Histórico", "timeline"]] },
-  { id: "g-pneus", label: "Pneus", icon: CircleDot, items: [["pneus", "Cadastro & Estoque", "pneus"], ["calibragem", "Calibragens", "pneus"], ["inspecao", "Inspeções", "pneus"]] },
+  { id: "g-pneus", label: "Pneus", icon: CircleDot, items: [["pneus", "Cadastro & Estoque", "pneus"], ["calibragem", "Calibragens", "pneus"], ["inspecao", "Inspeções", "pneus"], ["adm-marcas", "Marcas", "pneus"], ["adm-modelos", "Modelos", "pneus"], ["adm-medidas", "Medidas", "pneus"]] },
   { id: "g-rel", label: "Relatórios", icon: FileText, items: [["rel", "Central de Relatórios", "rel"]] },
   { id: "g-ia", label: "Assistente IA", icon: Sparkles, items: [["ia", "Gerente Virtual", "ia"], ["notif", "Alertas", "notif"]] },
   { id: "g-admin", label: "Administração", icon: ShieldCheck, items: [["users", "Usuários & Permissões", "users"], ["adm-diagramas", "Diagramas", "users"], ["adm-combustiveis", "Combustíveis", "users"], ["adm-tiposequip", "Tipos de Equipamento", "users"], ["adm-config", "Configurações", "users"], ["ajuda", "Central de Ajuda", null], ["audit", "Auditoria", "audit"]] },
@@ -2770,15 +3350,28 @@ export default function App() {
   const [seedOS, setSeedOS] = useState(null);
   const [openGroup, setOpenGroup] = useState("g-inicio");
 
+  const [bootErr, setBootErr] = useState("");
   useEffect(() => {
+    let done = false;
+    // Trava de segurança: nunca deixa a tela "Carregando" presa para sempre.
+    const safety = setTimeout(() => { if (!done) { console.warn("Boot excedeu 12s — liberando app com dados locais."); setBooted(true); } }, 12000);
     (async () => {
-      const loaded = {};
-      for (const d of DOMAINS) loaded[d] = await store.load(d, EMPTY[d]);
+      let loaded = {};
+      try {
+        // Carrega TODOS os domínios numa única operação (1 query no Supabase).
+        loaded = await loadAll(DOMAINS, EMPTY);
+      } catch (e) {
+        console.error("Erro no carregamento inicial:", e);
+        setBootErr("Não foi possível carregar todos os dados do servidor. O app abriu com os dados disponíveis.");
+        DOMAINS.forEach((d) => { if (loaded[d] === undefined) loaded[d] = EMPTY[d]; });
+      }
       loaded.settings = { ...EMPTY.settings, ...(loaded.settings || {}) };
       setPermOverrides(loaded.settings.permOverrides || {});
-      setData((prev) => ({ ...prev, ...loaded }));
+      setData((prev) => ({ ...prev, ...EMPTY, ...loaded }));
+      done = true; clearTimeout(safety);
       setBooted(true);
     })();
+    return () => clearTimeout(safety);
   }, []);
 
   const persist = async (patch) => { for (const k of Object.keys(patch)) await store.save(k, patch[k]); };
@@ -2808,8 +3401,8 @@ export default function App() {
   };
   const go = (p) => { setPage(p); setSidebar(false); };
 
-  if (!booted) return <div className="min-h-screen grid place-items-center bg-slate-50"><Spin label="Carregando Kairos Frota…" /></div>;
-  if (!user) return <Login users={data.users} onLogin={(u) => { setUser(u); setPage(can(u, "dash", "view") ? "dash" : can(u, "checklist", "view") ? "minhas" : "abast"); setData((p) => { const audit = [...p.audit, { id: uid(), ts: nowISO(), usuario: u.nome, perfil: u.perfil, acao: "Entrou no sistema" }]; persist({ audit }); return { ...p, audit }; }); }} onSeed={seedAdmin} />;
+  if (!booted) return <div className="min-h-screen grid place-items-center bg-slate-50"><div className="text-center"><img src={LOGO} alt="Kairos" className="h-14 w-auto mx-auto mb-4 object-contain opacity-90" /><Spin label="Carregando Kairos Frota…" /></div></div>;
+  if (!user) return <Login users={data.users} bootErr={bootErr} onLogin={(u) => { setUser(u); setPage(can(u, "dash", "view") ? "dash" : can(u, "checklist", "view") ? "minhas" : "abast"); setData((p) => { const audit = [...p.audit, { id: uid(), ts: nowISO(), usuario: u.nome, perfil: u.perfil, acao: "Entrou no sistema" }]; persist({ audit }); return { ...p, audit }; }); }} onSeed={seedAdmin} />;
 
   const critCount = alerts.filter((a) => a.nivel === "critico").length;
 
@@ -2836,6 +3429,9 @@ export default function App() {
       case "adm-combustiveis": return <Administracao data={data} save={save} user={user} sub="combustiveis" />;
       case "adm-diagramas": return <Administracao data={data} save={save} user={user} sub="diagramas" />;
       case "adm-tiposequip": return <Administracao data={data} save={save} user={user} sub="tiposequip" />;
+      case "adm-marcas": return <Administracao data={data} save={save} user={user} sub="marcas" />;
+      case "adm-modelos": return <Administracao data={data} save={save} user={user} sub="modelos" />;
+      case "adm-medidas": return <Administracao data={data} save={save} user={user} sub="medidas" />;
       case "adm-config": return <Administracao data={data} save={save} user={user} sub="config" />;
       case "ajuda": return <CentralAjuda />;
       case "audit": return <Auditoria data={data} />;
@@ -2898,7 +3494,7 @@ export default function App() {
           {critCount > 0 && <button onClick={() => go("notif")} className="ml-auto relative"><Bell size={20} className="text-slate-600" /><span className="absolute -top-1 -right-1 text-[9px] font-bold text-white bg-red-500 rounded-full px-1">{critCount}</span></button>}
         </header>
         <main className="flex-1 p-4 sm:p-6 max-w-[1400px] w-full mx-auto">{render()}</main>
-        <footer className="text-center text-[11px] text-slate-400 py-4 px-4">Kairos Frota · ERP de Gestão de Frotas · Kairos Telecom / Kaironanet Ltda — Pentecoste/CE · Dados salvos localmente neste navegador</footer>
+        <footer className="text-center text-[11px] text-slate-400 py-4 px-4">Kairos Frota · ERP de Gestão de Frotas · Kairos Telecom / Kaironanet Ltda — Pentecoste/CE · {hasSupabase ? "Dados sincronizados na nuvem (Supabase)" : "Dados salvos localmente neste navegador"}</footer>
       </div>
     </div>
   );
